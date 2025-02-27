@@ -13,7 +13,7 @@ from DVCManager import DVCManager
 from DVCWorker import DVCWorker
 from typing import Dict
 from LoggerManager import LoggerManager
-
+from kubernetes import client, config
 from DVCManager import DVCManager
 from DVCWorker import DVCWorker
 from typing import Dict
@@ -25,7 +25,7 @@ import shutil
 
 from minio import Minio
 from minio.error import S3Error
-
+import uuid
 
 # 设置基本的日志配置
 logging.basicConfig(level=logging.DEBUG)
@@ -80,11 +80,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# # PVC 掛載路徑
-# STORAGE_PATH = "/mnt/storage"
+# PVC 掛載路徑
+STORAGE_PATH = "/mnt/storage"
 
-# PVC 掛載路徑 (本地測試用)
-STORAGE_PATH = "/mnt/storage/test/test_training"
+# # PVC 掛載路徑 (本地測試用)
+# STORAGE_PATH = "/mnt/storage/test/test_training"
 
 
 # MinIO 設定
@@ -92,6 +92,7 @@ MINIO_URL = "10.52.52.138:31000"
 MINIO_ACCESS_KEY = "testdvctominio"
 MINIO_SECRET_KEY = "testdvctominio"
 BUCKET_NAME = "mock-dataset"
+
 
 # 定義 Request Body Schema
 class CreateFolderRequest(BaseModel):
@@ -182,9 +183,9 @@ async def register_dag_and_logger_and_dvc_worker(request: DagRequest):
     if not dag_id or not execution_id:
         raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
     
-    # # 檢查 PVC 掛載狀態
-    # if not is_pvc_mounted():
-    #     raise HTTPException(status_code=500, detail="PVC is not mounted.")
+    # 檢查 PVC 掛載狀態
+    if not is_pvc_mounted():
+        raise HTTPException(status_code=500, detail="PVC is not mounted.")
 
     # 組合路徑：/mnt/storage/{dag_id}_{execution_id}
     dag_root_folder_path = os.path.join(STORAGE_PATH, f"{dag_id}_{execution_id}")
@@ -223,9 +224,9 @@ async def setup_folders_for_training(request: DagRequest):
     if not dag_id or not execution_id:
         raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
     
-    # # 檢查 PVC 掛載狀態
-    # if not is_pvc_mounted():
-    #     raise HTTPException(status_code=500, detail="PVC is not mounted.")
+    # 檢查 PVC 掛載狀態
+    if not is_pvc_mounted():
+        raise HTTPException(status_code=500, detail="PVC is not mounted.")
 
     # 組合路徑：/mnt/storage/{dag_id}_{execution_id}
     dag_root_folder_path = os.path.join(STORAGE_PATH, f"{dag_id}_{execution_id}")
@@ -253,7 +254,28 @@ async def setup_folders_for_training(request: DagRequest):
 
         # 2. 在 dag_root_folder 内 git clone
         if not os.path.exists(repo_training_path):
-            git.Repo.clone_from(code_repo_url, repo_training_path)
+            # 取得環境變數中的 GITHUB_TOKEN
+            github_token = os.getenv("GITHUB_TOKEN")
+            if not github_token:
+                raise Exception("GITHUB_TOKEN not found in environment variables.")
+
+            # 使用 subprocess.run() 執行 git clone 指令
+            clone_command = [
+                "git", "clone", 
+                f"https://{github_token}@github.com/chen88088/NCU-RSS-1.5.git", 
+                repo_training_path
+            ]
+            result = subprocess.run(clone_command, capture_output=True, text=True)
+            
+            # 紀錄輸出與錯誤訊息
+            logger.info(f"STDOUT: {result.stdout}")
+            logger.error(f"STDERR: {result.stderr}")
+
+            # 檢查返回碼
+            if result.returncode != 0:
+                raise Exception("git clone failed")
+            
+            # 驗證是否成功 clone
             assert os.path.exists(repo_training_path), "Repo NCURSS-Training clone failed"
             logger.info(f"Cloned NCURSS-Training repo to {repo_training_path}")
         else:
@@ -317,8 +339,6 @@ def download_dataset_with_dvc(target_folder):
     if "failed to pull data from the cloud" in result.stderr:
         raise HTTPException(status_code=500, detail="Failed to pull data from the cloud. Check if the cache is up to date.")
     
-    
-
 # 下載 excel_file 資料夾
 def download_excel_files(minio_client, target_folder):
     excel_folder = os.path.join(target_folder, "excel_file")
@@ -341,7 +361,6 @@ def download_excel_files(minio_client, target_folder):
 
     except S3Error as e:
         raise HTTPException(status_code=500, detail=f"MinIO Error: {str(e)}")
-
 
 # 重組資料夾結構
 def reorganize_data_folder(target_folder):
@@ -387,10 +406,8 @@ def reorganize_data_folder(target_folder):
     else:
         print("No mapping.xlsx to move.")
 
-
-
 # API: 下載資料集
-# [Training/Training]
+# [Training/DownloadDataset]
 @app.post("/Training/DownloadDataset")
 async def download_dataset(request: DagRequest):
     """
@@ -402,9 +419,9 @@ async def download_dataset(request: DagRequest):
     if not dag_id or not execution_id:
         raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
     
-    # # 檢查 PVC 掛載狀態
-    # if not is_pvc_mounted():
-    #     raise HTTPException(status_code=500, detail="PVC is not mounted.")
+    # 檢查 PVC 掛載狀態
+    if not is_pvc_mounted():
+        raise HTTPException(status_code=500, detail="PVC is not mounted.")
 
     # 組合路徑：/mnt/storage/{dag_id}_{execution_id}/NCU-RSS-1.5/data
     target_folder = os.path.join(STORAGE_PATH, f"{dag_id}_{execution_id}", "NCU-RSS-1.5", "data")
@@ -434,769 +451,873 @@ async def download_dataset(request: DagRequest):
         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
 
+# [Training/ModifyConfig]
+@app.post("/Training/ModifyConfig")
+async def modify_config(request: DagRequest):
+    # pass
+    return {"status": "success", "message": f"Config Mofification Successfully!!"}
+
+# 初始化 Kubernetes 客戶端
+def init_k8s_client():
+    # 若在 K8s Cluster 內執行，則使用 In-Cluster Config
+    config.load_incluster_config()
+    return client.CoreV1Api()
+
+# [Training/ExecuteTrainingScripts]
+@app.post("/Training/ExecuteTrainingScripts")
+async def execute_training_scripts(request: DagRequest):
+    """
+    根據 TASK_STAGE_TYPE 起 Pod 並執行對應腳本
+    """
+    dag_id = request.DAG_ID
+    execution_id = request.EXECUTION_ID
+    task_stage_type = request.TASK_STAGE_TYPE
+
+    # 從 IMAGE_NAME 中抓取對應的 Image
+    image_name = request.IMAGE_NAME.get(task_stage_type)
+    if not image_name:
+        raise HTTPException(status_code=400, detail=f"No image found for TASK_STAGE_TYPE: {task_stage_type}")
+    
+    v1 = init_k8s_client()
+    
+    # Pod 名稱
+    pod_name = f"task-pod-{uuid.uuid4().hex[:6]}"
+    
+    # 確保 PVC_NAME 環境變量已設定
+    pvc_name = os.getenv("PVC_NAME")
+    if not pvc_name:
+        raise HTTPException(status_code=500, detail="PVC_NAME not set in environment variables")
+    
+    # 組合工作目錄
+    working_dir = f"/mnt/storage/{dag_id}_{execution_id}/NCU-RSS-1.5"
+    
+    # 定義要執行的腳本
+    scripts_to_run = [
+        "python3 kmeans_cluster_for_train_test.py",
+        "python3 random_sampling_for_parcel_dataset_for_train_test.py",
+        "python3 train_and_val_model.py"
+    ]
+
+    # 組合成 Command
+    command = " && ".join([f"cd {working_dir}"] + scripts_to_run)
+    
+    # 建立 Pod Manifest
+    pod_manifest = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": pod_name, 
+            "namespace": "ml-serving",
+            "labels": {
+                "app": "task-pod",
+                "type": "gpu"
+            }
+        },
+        "spec": {
+            "nodeSelector": {
+                "gpu-node": "true"
+            },
+            "containers": [
+                {
+                    "name": "task-container",
+                    "image": f"harbor.pdc.tw/{image_name}",
+                    "command": ["/bin/bash", "-c", command],
+                    "volumeMounts": [
+                        {
+                            "name": "shared-storage",
+                            "mountPath": "/mnt/storage"
+                        }
+                    ],
+                    "resources": {
+                        "limits": {
+                            "nvidia.com/gpu": "1"  # 限制 GPU 使用量
+                        }
+                    }
+                }
+            ],
+            "volumes": [
+                {
+                    "name": "shared-storage",
+                    "persistentVolumeClaim": {
+                        "claimName": pvc_name
+                    }
+                }
+            ],
+            "restartPolicy": "Never"  # 執行完成後不會重啟
+        }
+    }
+    
+    # 建立 Pod
+    try:
+        v1.create_namespaced_pod(namespace="ml-serving", body=pod_manifest)
+        return {"status": "success", "message": "Task Pod created", "pod_name": pod_name}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create Task Pod: {str(e)}")
 
 #########################################################################
-@app.post("/Training/register/RegisterLoggerAndDVCWorker")
-async def register_logger_and_dvc_worker(request: Request):
-    data = await request.json()
-    dag_id = data.get("DAG_ID")
-    execution_id = data.get("EXECUTION_ID")
-    inference_root_folder_name = data.get("inference_root_folder")
 
-    if not dag_id or not execution_id:
-        raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
+# '''
+# @app.post("/Training/register/RegisterLoggerAndDVCWorker")
+# async def register_logger_and_dvc_worker(request: Request):
+#     data = await request.json()
+#     dag_id = data.get("DAG_ID")
+#     execution_id = data.get("EXECUTION_ID")
+#     inference_root_folder_name = data.get("inference_root_folder")
 
-    # 初始化并注册 Logger
-    if not logger_manager.logger_exists(dag_id, execution_id):
-        logger_manager.init_logger(dag_id, execution_id, inference_root_folder_name)
-    else:
-        return {"status": "error", "message": "Logger already initialized for this DAG execution."}
+#     if not dag_id or not execution_id:
+#         raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
+
+#     # 初始化并注册 Logger
+#     if not logger_manager.logger_exists(dag_id, execution_id):
+#         logger_manager.init_logger(dag_id, execution_id, inference_root_folder_name)
+#     else:
+#         return {"status": "error", "message": "Logger already initialized for this DAG execution."}
 
 
-    # 初始化并注册 DVCWorker
-    moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
-    git_local_repo_for_dvc = moa_inference_folder / "GIT_LOCAL_REPO_FOR_DVC"
-    dvc_manager.init_worker(dag_id=dag_id, execution_id=execution_id, git_repo_path=git_local_repo_for_dvc)
+#     # 初始化并注册 DVCWorker
+#     moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
+#     git_local_repo_for_dvc = moa_inference_folder / "GIT_LOCAL_REPO_FOR_DVC"
+#     dvc_manager.init_worker(dag_id=dag_id, execution_id=execution_id, git_repo_path=git_local_repo_for_dvc)
 
-    return {"status": "success", "message": f"Logger and DVCWorker initialized for DAG_ID: {dag_id}, EXECUTION_ID: {execution_id}"}
+#     return {"status": "success", "message": f"Logger and DVCWorker initialized for DAG_ID: {dag_id}, EXECUTION_ID: {execution_id}"}
 
-@app.post("/INFERENCE/setup/SetupAllFoldersForPrediction")
-async def setup_all_folders_for_prediction(request: Request):
-    data = await request.json()  # 获取 POST 请求的 JSON 数据
-    dag_id = data.get("DAG_ID")
-    execution_id = data.get("EXECUTION_ID")
-    inference_root_folder_name = data.get("inference_root_folder")
+# @app.post("/INFERENCE/setup/SetupAllFoldersForPrediction")
+# async def setup_all_folders_for_prediction(request: Request):
+#     data = await request.json()  # 获取 POST 请求的 JSON 数据
+#     dag_id = data.get("DAG_ID")
+#     execution_id = data.get("EXECUTION_ID")
+#     inference_root_folder_name = data.get("inference_root_folder")
 
-    if not dag_id or not execution_id:
-        raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
+#     if not dag_id or not execution_id:
+#         raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
 
-    # 获取或初始化 Logger 和 DVCWorker
-    logger = logger_manager.get_logger(dag_id, execution_id)
-    dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
+#     # 获取或初始化 Logger 和 DVCWorker
+#     logger = logger_manager.get_logger(dag_id, execution_id)
+#     dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
 
-    try:
-        logger.info(f"Received request with data: {data}")
+#     try:
+#         logger.info(f"Received request with data: {data}")
 
-        # 1. 确认桌面是否有创建 "moa_inference_folder"
-        moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
-        if not moa_inference_folder.exists():
-            raise HTTPException(status_code=404, detail="moa_inference_folder was not created")
-        logger.info(f"Confirmed existence of {moa_inference_folder}")
+#         # 1. 确认桌面是否有创建 "moa_inference_folder"
+#         moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
+#         if not moa_inference_folder.exists():
+#             raise HTTPException(status_code=404, detail="moa_inference_folder was not created")
+#         logger.info(f"Confirmed existence of {moa_inference_folder}")
 
-        # 2-1. 在 "moa_inference_folder" 内创建 "final_predicted_result"
-        final_predicted_result = moa_inference_folder / "final_predicted_result"
-        final_predicted_result.mkdir(parents=True, exist_ok=True)
-        assert final_predicted_result.exists(), "final_predicted_result was not created"
-        logger.info(f"Created final_predicted_result folder at {final_predicted_result}")
+#         # 2-1. 在 "moa_inference_folder" 内创建 "final_predicted_result"
+#         final_predicted_result = moa_inference_folder / "final_predicted_result"
+#         final_predicted_result.mkdir(parents=True, exist_ok=True)
+#         assert final_predicted_result.exists(), "final_predicted_result was not created"
+#         logger.info(f"Created final_predicted_result folder at {final_predicted_result}")
 
-        # 2-2. 在 "moa_inference_folder" 内创建 "IMG"
-        IMG_folder = moa_inference_folder / "IMG"
-        IMG_folder.mkdir(parents=True, exist_ok=True)
-        assert IMG_folder.exists(), "IMG folder was not created"
-        logger.info(f"Created IMG folder at {IMG_folder}")
+#         # 2-2. 在 "moa_inference_folder" 内创建 "IMG"
+#         IMG_folder = moa_inference_folder / "IMG"
+#         IMG_folder.mkdir(parents=True, exist_ok=True)
+#         assert IMG_folder.exists(), "IMG folder was not created"
+#         logger.info(f"Created IMG folder at {IMG_folder}")
 
-        # 2-3. 检查GIT LOCAL REPO FOR DVC
-        dvc_worker.ensure_git_repository()
-        logger.info("Ensured Git repository for DVC")
+#         # 2-3. 检查GIT LOCAL REPO FOR DVC
+#         dvc_worker.ensure_git_repository()
+#         logger.info("Ensured Git repository for DVC")
 
-        # 3. 在 moa_inference_folder 内 git clone
-        repo_preprocessing_path = moa_inference_folder / "NCU-RSS-Predict-Preprocessing"
-        git.Repo.clone_from("https://github.com/chen88088/NCU-RSS-Predict-Preprocessing.git", repo_preprocessing_path)
-        assert repo_preprocessing_path.exists(), "Repo_ preprocessing clone failed"
-        logger.info(f"Cloned preprocessing repo to {repo_preprocessing_path}")
+#         # 3. 在 moa_inference_folder 内 git clone
+#         repo_preprocessing_path = moa_inference_folder / "NCU-RSS-Predict-Preprocessing"
+#         git.Repo.clone_from("https://github.com/chen88088/NCU-RSS-Predict-Preprocessing.git", repo_preprocessing_path)
+#         assert repo_preprocessing_path.exists(), "Repo_ preprocessing clone failed"
+#         logger.info(f"Cloned preprocessing repo to {repo_preprocessing_path}")
 
-        # 4. 根据模型创建 inference_x 文件夹
-        model = data.get("model")
-        model_folder = moa_inference_folder / f"inference_{model}"
-        model_folder.mkdir(parents=True, exist_ok=True)
-        git.Repo.clone_from("https://github.com/chen88088/NCU-RSS-1.5.git", model_folder / "NCU-RSS-1.5")
-        logger.info(f"Cloned model repo for {model} to {model_folder}")
+#         # 4. 根据模型创建 inference_x 文件夹
+#         model = data.get("model")
+#         model_folder = moa_inference_folder / f"inference_{model}"
+#         model_folder.mkdir(parents=True, exist_ok=True)
+#         git.Repo.clone_from("https://github.com/chen88088/NCU-RSS-1.5.git", model_folder / "NCU-RSS-1.5")
+#         logger.info(f"Cloned model repo for {model} to {model_folder}")
 
-        # 创建目录结构
-        data_folder = model_folder / "NCU-RSS-1.5" / "data" / "inference" / "NRG_png"
-        data_folder.mkdir(parents=True, exist_ok=True)
-        mask_folder = model_folder / "NCU-RSS-1.5" / "data" / "inference" / "parcel_mask"
-        mask_folder.mkdir(parents=True, exist_ok=True)
-        modelforpredict_folder = model_folder / "NCU-RSS-1.5" / "data" / "inference" / "saved_model_and_prediction"
-        modelforpredict_folder.mkdir(parents=True, exist_ok=True)
+#         # 创建目录结构
+#         data_folder = model_folder / "NCU-RSS-1.5" / "data" / "inference" / "NRG_png"
+#         data_folder.mkdir(parents=True, exist_ok=True)
+#         mask_folder = model_folder / "NCU-RSS-1.5" / "data" / "inference" / "parcel_mask"
+#         mask_folder.mkdir(parents=True, exist_ok=True)
+#         modelforpredict_folder = model_folder / "NCU-RSS-1.5" / "data" / "inference" / "saved_model_and_prediction"
+#         modelforpredict_folder.mkdir(parents=True, exist_ok=True)
         
-        assert data_folder.exists() and mask_folder.exists() and modelforpredict_folder.exists(), f"Data directories creation failed for model {model}"
-        logger.info(f"Created directories for model {model}")
+#         assert data_folder.exists() and mask_folder.exists() and modelforpredict_folder.exists(), f"Data directories creation failed for model {model}"
+#         logger.info(f"Created directories for model {model}")
 
-        # 5. 在 "moa_inference_folder" 内创建 "NCU-RSS-Predict-Postprocessing"
-        repo_postprocessing_path = moa_inference_folder / "NCU-RSS-Predict-Postprocessing"
-        git.Repo.clone_from("https://github.com/chen88088/NCU-RSS-Predict-Postprocessing.git", repo_postprocessing_path)
-        assert repo_postprocessing_path.exists(), "Repo_postprocessing clone failed"
-        logger.info(f"Cloned postprocessing repo to {repo_postprocessing_path}")
+#         # 5. 在 "moa_inference_folder" 内创建 "NCU-RSS-Predict-Postprocessing"
+#         repo_postprocessing_path = moa_inference_folder / "NCU-RSS-Predict-Postprocessing"
+#         git.Repo.clone_from("https://github.com/chen88088/NCU-RSS-Predict-Postprocessing.git", repo_postprocessing_path)
+#         assert repo_postprocessing_path.exists(), "Repo_postprocessing clone failed"
+#         logger.info(f"Cloned postprocessing repo to {repo_postprocessing_path}")
 
-        logger.info(f"[setup]SetupAllFoldersForPrediction finished for dag: {dag_id}_{execution_id}   !!!")
+#         logger.info(f"[setup]SetupAllFoldersForPrediction finished for dag: {dag_id}_{execution_id}   !!!")
 
-        return {"status": "success"}
+#         return {"status": "success"}
 
-    except HTTPException as e:
-        logger.error(f"HTTPException occurred: {str(e.detail)}")
-        raise e
-    except Exception as e:
-        logger.error(f"An error occurred: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+#     except HTTPException as e:
+#         logger.error(f"HTTPException occurred: {str(e.detail)}")
+#         raise e
+#     except Exception as e:
+#         logger.error(f"An error occurred: {str(e)}")
+#         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/INFERENCE/preprocessing/ModifyPreprocessingConfig")
-async def modify_preprocessing_config(request: Request):
-    data = await request.json()
-    dag_id = data.get("DAG_ID")
-    execution_id = data.get("EXECUTION_ID")
-    inference_root_folder_name = data.get("inference_root_folder")
+# @app.post("/INFERENCE/preprocessing/ModifyPreprocessingConfig")
+# async def modify_preprocessing_config(request: Request):
+#     data = await request.json()
+#     dag_id = data.get("DAG_ID")
+#     execution_id = data.get("EXECUTION_ID")
+#     inference_root_folder_name = data.get("inference_root_folder")
 
-    if not dag_id or not execution_id:
-        raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
+#     if not dag_id or not execution_id:
+#         raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
 
-    # 获取或初始化 Logger 和 DVCWorker
-    logger = logger_manager.get_logger(dag_id, execution_id)
+#     # 获取或初始化 Logger 和 DVCWorker
+#     logger = logger_manager.get_logger(dag_id, execution_id)
 
-    try:
-        moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
-        root_folder_path = Path(moa_inference_folder)
-        repo_preprocessing_path = Path(root_folder_path / "NCU-RSS-Predict-Preprocessing")
-        config_path = Path(root_folder_path / "NCU-RSS-Predict-Preprocessing" / "configs" / "config.py")
+#     try:
+#         moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
+#         root_folder_path = Path(moa_inference_folder)
+#         repo_preprocessing_path = Path(root_folder_path / "NCU-RSS-Predict-Preprocessing")
+#         config_path = Path(root_folder_path / "NCU-RSS-Predict-Preprocessing" / "configs" / "config.py")
 
-        logger.info(f"Modifying config at {config_path} with data: {data}")
+#         logger.info(f"Modifying config at {config_path} with data: {data}")
 
-        # 读取并修改配置文件
-        with open(config_path, "r", encoding='utf-8') as file:
-            config_content = file.read()
-        config_content = config_content.replace(r'D:\SHP', data["SHP_Path"])
-        config_content = config_content.replace(r'D:\TIF', data["TIF_Path"])
-        config_content = config_content.replace(r'C:\Users\chen88088\Desktop', str(repo_preprocessing_path))
+#         # 读取并修改配置文件
+#         with open(config_path, "r", encoding='utf-8') as file:
+#             config_content = file.read()
+#         config_content = config_content.replace(r'D:\SHP', data["SHP_Path"])
+#         config_content = config_content.replace(r'D:\TIF', data["TIF_Path"])
+#         config_content = config_content.replace(r'C:\Users\chen88088\Desktop', str(repo_preprocessing_path))
         
-        with open(config_path, "w", encoding='utf-8') as file:
-            file.write(config_content)
-        logger.info(f"Config file {config_path} modified successfully")
+#         with open(config_path, "w", encoding='utf-8') as file:
+#             file.write(config_content)
+#         logger.info(f"Config file {config_path} modified successfully")
 
-        # 验证文件内容
-        with open(config_path, "r", encoding='utf-8') as file:
-            verified_content = file.read()
-        assert data["SHP_Path"] in verified_content, "SHP_Path not updated"
-        assert data["TIF_Path"] in verified_content, "TIF_Path not updated"
-        assert str(repo_preprocessing_path) in verified_content, "directory not updated"
-        logger.info(f"Config file {config_path} verification successful")
+#         # 验证文件内容
+#         with open(config_path, "r", encoding='utf-8') as file:
+#             verified_content = file.read()
+#         assert data["SHP_Path"] in verified_content, "SHP_Path not updated"
+#         assert data["TIF_Path"] in verified_content, "TIF_Path not updated"
+#         assert str(repo_preprocessing_path) in verified_content, "directory not updated"
+#         logger.info(f"Config file {config_path} verification successful")
         
-        logger.info(f"[preprocessing]ModifyPreprocessingConfig finished for dag: {dag_id}_{execution_id}   !!!")
+#         logger.info(f"[preprocessing]ModifyPreprocessingConfig finished for dag: {dag_id}_{execution_id}   !!!")
 
-    except Exception as e:
-        logger.error(f"An error occurred during config modification: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Config modification failed: {str(e)}")
+#     except Exception as e:
+#         logger.error(f"An error occurred during config modification: {str(e)}")
+#         raise HTTPException(status_code=500, detail=f"Config modification failed: {str(e)}")
 
-    return {"status": "success", "message": "Config modified successfully"}
+#     return {"status": "success", "message": "Config modified successfully"}
 
-@app.post("/INFERENCE/preprocessing/ExecutePredictPreprocessing")
-async def execute_predict_preprocessing(request: Request):
-    data = await request.json()
-    dag_id = data.get("DAG_ID")
-    execution_id = data.get("EXECUTION_ID")
-    inference_root_folder_name = data.get("inference_root_folder")
+# @app.post("/INFERENCE/preprocessing/ExecutePredictPreprocessing")
+# async def execute_predict_preprocessing(request: Request):
+#     data = await request.json()
+#     dag_id = data.get("DAG_ID")
+#     execution_id = data.get("EXECUTION_ID")
+#     inference_root_folder_name = data.get("inference_root_folder")
 
-    if not dag_id or not execution_id:
-        raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
+#     if not dag_id or not execution_id:
+#         raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
 
-    # 获取或初始化 Logger 和 DVCWorker
-    logger = logger_manager.get_logger(dag_id, execution_id)
+#     # 获取或初始化 Logger 和 DVCWorker
+#     logger = logger_manager.get_logger(dag_id, execution_id)
 
-    moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
-    root_folder_path = Path(moa_inference_folder)
-    repo_preprocessing_path = Path(root_folder_path / "NCU-RSS-Predict-Preprocessing")
-    script_path = Path(repo_preprocessing_path / "prepare_inference_data_15.py")
-    python_executable = r'C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe'
+#     moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
+#     root_folder_path = Path(moa_inference_folder)
+#     repo_preprocessing_path = Path(root_folder_path / "NCU-RSS-Predict-Preprocessing")
+#     script_path = Path(repo_preprocessing_path / "prepare_inference_data_15.py")
+#     python_executable = r'C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe'
 
-    try:
-        logger.info(f"Executing script {script_path} with Python {python_executable}")
+#     try:
+#         logger.info(f"Executing script {script_path} with Python {python_executable}")
 
-        # 使用 subprocess.run 执行 Python 脚本
-        result = subprocess.run([python_executable, script_path], check=True, text=True, capture_output=True)
+#         # 使用 subprocess.run 执行 Python 脚本
+#         result = subprocess.run([python_executable, script_path], check=True, text=True, capture_output=True)
         
-        logger.info(f"Script executed successfully. stdout: {result.stdout}, stderr: {result.stderr}")
+#         logger.info(f"Script executed successfully. stdout: {result.stdout}, stderr: {result.stderr}")
 
-        logger.info(f"[preprocessing]ExecutePredictPreprocessing finished for dag: {dag_id}_{execution_id}   !!!")
-        return {
-            "status": "success",
-            "stdout": result.stdout,
-            "stderr": result.stderr
-        } 
+#         logger.info(f"[preprocessing]ExecutePredictPreprocessing finished for dag: {dag_id}_{execution_id}   !!!")
+#         return {
+#             "status": "success",
+#             "stdout": result.stdout,
+#             "stderr": result.stderr
+#         } 
         
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Error executing script: {e.stderr}")
-        return {
-            "status": "error",
-            "stdout": e.stdout,
-            "stderr": e.stderr
-        }, 500
-    except Exception as e:
-        logger.error(f"Unexpected error occurred: {str(e)}")
-        return {"message": str(e)}, 500
+#     except subprocess.CalledProcessError as e:
+#         logger.error(f"Error executing script: {e.stderr}")
+#         return {
+#             "status": "error",
+#             "stdout": e.stdout,
+#             "stderr": e.stderr
+#         }, 500
+#     except Exception as e:
+#         logger.error(f"Unexpected error occurred: {str(e)}")
+#         return {"message": str(e)}, 500
 
-@app.post("/INFERENCE/preprocessing/UploadMaskAndNirrgFolders")
-async def upload_mask_and_nirrg_folders(request: Request):
-    data = await request.json()  # 获取 POST 请求的 JSON 数据
-    dag_id = data.get("DAG_ID")
-    execution_id = data.get("EXECUTION_ID")
+# @app.post("/INFERENCE/preprocessing/UploadMaskAndNirrgFolders")
+# async def upload_mask_and_nirrg_folders(request: Request):
+#     data = await request.json()  # 获取 POST 请求的 JSON 数据
+#     dag_id = data.get("DAG_ID")
+#     execution_id = data.get("EXECUTION_ID")
 
-    if not dag_id or not execution_id:
-        raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
+#     if not dag_id or not execution_id:
+#         raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
 
-    # 获取或初始化 Logger 和 DVCWorker
-    logger = logger_manager.get_logger(dag_id, execution_id)
-    dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
+#     # 获取或初始化 Logger 和 DVCWorker
+#     logger = logger_manager.get_logger(dag_id, execution_id)
+#     dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
 
-    try:
-        inference_root_folder_name = data.get("inference_root_folder")
-        moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
-        root_folder_path = Path(moa_inference_folder)
-        repo_preprocessing_path = root_folder_path / "NCU-RSS-Predict-Preprocessing"
+#     try:
+#         inference_root_folder_name = data.get("inference_root_folder")
+#         moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
+#         root_folder_path = Path(moa_inference_folder)
+#         repo_preprocessing_path = root_folder_path / "NCU-RSS-Predict-Preprocessing"
         
-        # 初始化 DVC 本地仓库，并配置 MinIO as remote-storage
-        dvc_repo = repo_preprocessing_path / "data"
-        logger.info(f"Initializing DVC repository at {dvc_repo}")
+#         # 初始化 DVC 本地仓库，并配置 MinIO as remote-storage
+#         dvc_repo = repo_preprocessing_path / "data"
+#         logger.info(f"Initializing DVC repository at {dvc_repo}")
         
-        init_result = dvc_worker.initialize_dvc(dvc_repo)
-        if init_result["status"] == "error":
-            logger.error(f"Failed to initialize DVC: {init_result['message']}")
-            raise HTTPException(status_code=500, detail=init_result["message"])
+#         init_result = dvc_worker.initialize_dvc(dvc_repo)
+#         if init_result["status"] == "error":
+#             logger.error(f"Failed to initialize DVC: {init_result['message']}")
+#             raise HTTPException(status_code=500, detail=init_result["message"])
 
-        # 定义子文件夹的相对路径
-        src_mask_folder = 'RSS15_Training_rice_mask'
-        src_nirrg_folder = 'predict_NIRRG'
+#         # 定义子文件夹的相对路径
+#         src_mask_folder = 'RSS15_Training_rice_mask'
+#         src_nirrg_folder = 'predict_NIRRG'
 
-        # 使用 DVC 管理文件夹并推送到 MinIO
-        logger.info(f"Adding and pushing folder {src_mask_folder} to DVC")
-        add_and_push_mask_result = dvc_worker.add_and_push_data(
-            folder_path=f"{dvc_repo}/{src_mask_folder}",
-            folder_name=src_mask_folder
-        )
-        if add_and_push_mask_result["status"] == "error":
-            logger.error(f"Failed to add and push {src_mask_folder}: {add_and_push_mask_result['message']}")
-            raise HTTPException(status_code=500, detail=add_and_push_mask_result["message"])
+#         # 使用 DVC 管理文件夹并推送到 MinIO
+#         logger.info(f"Adding and pushing folder {src_mask_folder} to DVC")
+#         add_and_push_mask_result = dvc_worker.add_and_push_data(
+#             folder_path=f"{dvc_repo}/{src_mask_folder}",
+#             folder_name=src_mask_folder
+#         )
+#         if add_and_push_mask_result["status"] == "error":
+#             logger.error(f"Failed to add and push {src_mask_folder}: {add_and_push_mask_result['message']}")
+#             raise HTTPException(status_code=500, detail=add_and_push_mask_result["message"])
 
-        logger.info(f"Adding and pushing folder {src_nirrg_folder} to DVC")
-        add_and_push_nirrg_result = dvc_worker.add_and_push_data(
-            folder_path=f"{dvc_repo}/{src_nirrg_folder}",
-            folder_name=src_nirrg_folder
-        )
-        if add_and_push_nirrg_result["status"] == "error":
-            logger.error(f"Failed to add and push {src_nirrg_folder}: {add_and_push_nirrg_result['message']}")
-            raise HTTPException(status_code=500, detail=add_and_push_nirrg_result["message"])
+#         logger.info(f"Adding and pushing folder {src_nirrg_folder} to DVC")
+#         add_and_push_nirrg_result = dvc_worker.add_and_push_data(
+#             folder_path=f"{dvc_repo}/{src_nirrg_folder}",
+#             folder_name=src_nirrg_folder
+#         )
+#         if add_and_push_nirrg_result["status"] == "error":
+#             logger.error(f"Failed to add and push {src_nirrg_folder}: {add_and_push_nirrg_result['message']}")
+#             raise HTTPException(status_code=500, detail=add_and_push_nirrg_result["message"])
 
-        # 将所有更改提交并推送到 Git
-        logger.info(f"Committing and pushing DVC changes for {src_mask_folder} and {src_nirrg_folder} to Git")
-        git_commit_result = dvc_worker.git_add_commit_and_push(
-            project_path=root_folder_path,
-            message=f"Add and track folder {src_mask_folder} and {src_nirrg_folder} with DVC"
-        )
-        if git_commit_result["status"] == "error":
-            logger.error(f"Failed to commit and push to Git: {git_commit_result['message']}")
-            raise HTTPException(status_code=500, detail=git_commit_result["message"])
+#         # 将所有更改提交并推送到 Git
+#         logger.info(f"Committing and pushing DVC changes for {src_mask_folder} and {src_nirrg_folder} to Git")
+#         git_commit_result = dvc_worker.git_add_commit_and_push(
+#             project_path=root_folder_path,
+#             message=f"Add and track folder {src_mask_folder} and {src_nirrg_folder} with DVC"
+#         )
+#         if git_commit_result["status"] == "error":
+#             logger.error(f"Failed to commit and push to Git: {git_commit_result['message']}")
+#             raise HTTPException(status_code=500, detail=git_commit_result["message"])
 
-        logger.info(f"Successfully added and pushed {src_mask_folder} and {src_nirrg_folder} to DVC and Git")
+#         logger.info(f"Successfully added and pushed {src_mask_folder} and {src_nirrg_folder} to DVC and Git")
 
-        logger.info(f"[preprocessing]UploadMaskAndNirrgFolders finished for dag: {dag_id}_{execution_id}   !!!")
+#         logger.info(f"[preprocessing]UploadMaskAndNirrgFolders finished for dag: {dag_id}_{execution_id}   !!!")
 
-        return {"status": "success", "message": f"The folders '{src_mask_folder}' and '{src_nirrg_folder}' have been added and pushed to DVC."}
+#         return {"status": "success", "message": f"The folders '{src_mask_folder}' and '{src_nirrg_folder}' have been added and pushed to DVC."}
 
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logger.error(f"Unexpected error occurred: {str(e)}")
-        return {"status": "error", "message": str(e)}, 500
+#     except HTTPException as e:
+#         raise e
+#     except Exception as e:
+#         logger.error(f"Unexpected error occurred: {str(e)}")
+#         return {"status": "error", "message": str(e)}, 500
 
-@app.post("/INFERENCE/inference/DownloadPreprocessingMaskAndNirrgFolders")
-async def download_preprocessing_mask_and_nirrg_folders(request: Request):
-    data = await request.json()  # 获取 POST 请求的 JSON 数据
+# @app.post("/INFERENCE/inference/DownloadPreprocessingMaskAndNirrgFolders")
+# async def download_preprocessing_mask_and_nirrg_folders(request: Request):
+#     data = await request.json()  # 获取 POST 请求的 JSON 数据
 
-    dag_id = data.get("DAG_ID")
-    execution_id = data.get("EXECUTION_ID")
-    inference_model_id = data.get("model")
+#     dag_id = data.get("DAG_ID")
+#     execution_id = data.get("EXECUTION_ID")
+#     inference_model_id = data.get("model")
 
-    if not dag_id or not execution_id:
-        raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
+#     if not dag_id or not execution_id:
+#         raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
     
-    # 获取 Logger 和 DVCWorker
-    logger = logger_manager.get_logger(dag_id, execution_id)
-    dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
+#     # 获取 Logger 和 DVCWorker
+#     logger = logger_manager.get_logger(dag_id, execution_id)
+#     dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
 
-    # 定义 DVC 文件名
-    dvc_mask_filename = "RSS15_Training_rice_mask.dvc"
-    dvc_nirrg_filename = "predict_NIRRG.dvc"
+#     # 定义 DVC 文件名
+#     dvc_mask_filename = "RSS15_Training_rice_mask.dvc"
+#     dvc_nirrg_filename = "predict_NIRRG.dvc"
 
-    # 临时目录，用于拉取 DVC 数据
-    inference_root_folder_name = data.get("inference_root_folder")
-    moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
-    root_folder_path = Path(moa_inference_folder)
-    inference_folder_path = root_folder_path / f'inference_{inference_model_id}' 
-    temp_inference_download_folder = inference_folder_path / "temp_inference_download"
-    temp_inference_download_folder.mkdir(parents=True, exist_ok=True)
+#     # 临时目录，用于拉取 DVC 数据
+#     inference_root_folder_name = data.get("inference_root_folder")
+#     moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
+#     root_folder_path = Path(moa_inference_folder)
+#     inference_folder_path = root_folder_path / f'inference_{inference_model_id}' 
+#     temp_inference_download_folder = inference_folder_path / "temp_inference_download"
+#     temp_inference_download_folder.mkdir(parents=True, exist_ok=True)
 
-    try:
-        # 拉取 RSS15_Training_rice_mask 数据
-        logger.info(f"Pulling {dvc_mask_filename} into {temp_inference_download_folder}")
-        result_mask = dvc_worker.pull(dvc_mask_filename, temp_inference_download_folder)
-        if result_mask["status"] == "error":
-            logger.error(f"Failed to pull {dvc_mask_filename}: {result_mask['message']}")
-            raise HTTPException(status_code=500, detail=f"Failed to pull mask data: {result_mask['message']}")
+#     try:
+#         # 拉取 RSS15_Training_rice_mask 数据
+#         logger.info(f"Pulling {dvc_mask_filename} into {temp_inference_download_folder}")
+#         result_mask = dvc_worker.pull(dvc_mask_filename, temp_inference_download_folder)
+#         if result_mask["status"] == "error":
+#             logger.error(f"Failed to pull {dvc_mask_filename}: {result_mask['message']}")
+#             raise HTTPException(status_code=500, detail=f"Failed to pull mask data: {result_mask['message']}")
 
-        # 拉取 predict_NIRRG 数据
-        logger.info(f"Pulling {dvc_nirrg_filename} into {temp_inference_download_folder}")
-        result_nirrg = dvc_worker.pull(dvc_nirrg_filename, temp_inference_download_folder)
-        if result_nirrg["status"] == "error":
-            logger.error(f"Failed to pull {dvc_nirrg_filename}: {result_nirrg['message']}")
-            raise HTTPException(status_code=500, detail=f"Failed to pull NIRRG data: {result_nirrg['message']}")
+#         # 拉取 predict_NIRRG 数据
+#         logger.info(f"Pulling {dvc_nirrg_filename} into {temp_inference_download_folder}")
+#         result_nirrg = dvc_worker.pull(dvc_nirrg_filename, temp_inference_download_folder)
+#         if result_nirrg["status"] == "error":
+#             logger.error(f"Failed to pull {dvc_nirrg_filename}: {result_nirrg['message']}")
+#             raise HTTPException(status_code=500, detail=f"Failed to pull NIRRG data: {result_nirrg['message']}")
 
-        # 目标文件夹路径
-        dest_mask_folder = inference_folder_path / 'NCU-RSS-1.5' / 'data' / 'inference' / 'parcel_mask'
-        dest_nirrg_folder = inference_folder_path / 'NCU-RSS-1.5' / 'data' / 'inference' / 'NRG_png'
+#         # 目标文件夹路径
+#         dest_mask_folder = inference_folder_path / 'NCU-RSS-1.5' / 'data' / 'inference' / 'parcel_mask'
+#         dest_nirrg_folder = inference_folder_path / 'NCU-RSS-1.5' / 'data' / 'inference' / 'NRG_png'
 
-        # 确保目标文件夹的父目录存在
-        os.makedirs(dest_mask_folder.parent, exist_ok=True)
-        os.makedirs(dest_nirrg_folder.parent, exist_ok=True)
+#         # 确保目标文件夹的父目录存在
+#         os.makedirs(dest_mask_folder.parent, exist_ok=True)
+#         os.makedirs(dest_nirrg_folder.parent, exist_ok=True)
 
-        # 如果目标目录已经存在，先删除
-        if dest_mask_folder.exists():
-            logger.info(f"Deleting existing folder {dest_mask_folder}")
-            shutil.rmtree(dest_mask_folder)
-            if dest_mask_folder.exists():
-                logger.error(f"Failed to delete {dest_mask_folder}")
-                raise HTTPException(status_code=500, detail=f"Failed to delete {dest_mask_folder}")
+#         # 如果目标目录已经存在，先删除
+#         if dest_mask_folder.exists():
+#             logger.info(f"Deleting existing folder {dest_mask_folder}")
+#             shutil.rmtree(dest_mask_folder)
+#             if dest_mask_folder.exists():
+#                 logger.error(f"Failed to delete {dest_mask_folder}")
+#                 raise HTTPException(status_code=500, detail=f"Failed to delete {dest_mask_folder}")
 
-        if dest_nirrg_folder.exists():
-            logger.info(f"Deleting existing folder {dest_nirrg_folder}")
-            shutil.rmtree(dest_nirrg_folder)
-            if dest_nirrg_folder.exists():
-                logger.error(f"Failed to delete {dest_nirrg_folder}")
-                raise HTTPException(status_code=500, detail=f"Failed to delete {dest_nirrg_folder}")
+#         if dest_nirrg_folder.exists():
+#             logger.info(f"Deleting existing folder {dest_nirrg_folder}")
+#             shutil.rmtree(dest_nirrg_folder)
+#             if dest_nirrg_folder.exists():
+#                 logger.error(f"Failed to delete {dest_nirrg_folder}")
+#                 raise HTTPException(status_code=500, detail=f"Failed to delete {dest_nirrg_folder}")
 
-        # 重命名目录为目标目录
-        logger.info(f"Renaming {temp_inference_download_folder / 'RSS15_Training_rice_mask'} to {dest_mask_folder}")
-        (temp_inference_download_folder / 'RSS15_Training_rice_mask').rename(dest_mask_folder)
-        if not dest_mask_folder.exists():
-            logger.error(f"Failed to rename folder to {dest_mask_folder}")
-            raise HTTPException(status_code=500, detail=f"Failed to rename folder to {dest_mask_folder}")
+#         # 重命名目录为目标目录
+#         logger.info(f"Renaming {temp_inference_download_folder / 'RSS15_Training_rice_mask'} to {dest_mask_folder}")
+#         (temp_inference_download_folder / 'RSS15_Training_rice_mask').rename(dest_mask_folder)
+#         if not dest_mask_folder.exists():
+#             logger.error(f"Failed to rename folder to {dest_mask_folder}")
+#             raise HTTPException(status_code=500, detail=f"Failed to rename folder to {dest_mask_folder}")
 
-        logger.info(f"Renaming {temp_inference_download_folder / 'predict_NIRRG'} to {dest_nirrg_folder}")
-        (temp_inference_download_folder / 'predict_NIRRG').rename(dest_nirrg_folder)
-        if not dest_nirrg_folder.exists():
-            logger.error(f"Failed to rename folder to {dest_nirrg_folder}")
-            raise HTTPException(status_code=500, detail=f"Failed to rename folder to {dest_nirrg_folder}")
+#         logger.info(f"Renaming {temp_inference_download_folder / 'predict_NIRRG'} to {dest_nirrg_folder}")
+#         (temp_inference_download_folder / 'predict_NIRRG').rename(dest_nirrg_folder)
+#         if not dest_nirrg_folder.exists():
+#             logger.error(f"Failed to rename folder to {dest_nirrg_folder}")
+#             raise HTTPException(status_code=500, detail=f"Failed to rename folder to {dest_nirrg_folder}")
 
-        # 返回成功响应
-        logger.info(f"Successfully downloaded and renamed preprocessing folders for DAG {dag_id}, execution {execution_id}")
-        logger.info(f"[inference]DownloadPreprocessingMaskAndNirrgFolders finished for dag: {dag_id}_{execution_id}   !!!")
-        return {"status": "success"}
-    except Exception as e:
-        logger.error(f"Unexpected error occurred: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+#         # 返回成功响应
+#         logger.info(f"Successfully downloaded and renamed preprocessing folders for DAG {dag_id}, execution {execution_id}")
+#         logger.info(f"[inference]DownloadPreprocessingMaskAndNirrgFolders finished for dag: {dag_id}_{execution_id}   !!!")
+#         return {"status": "success"}
+#     except Exception as e:
+#         logger.error(f"Unexpected error occurred: {str(e)}")
+#         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/INFERENCE/inference/FetchModel")
-async def fetch_model(request: Request):
-    data = await request.json()  # 获取 POST 请求的 JSON 数据
+# @app.post("/INFERENCE/inference/FetchModel")
+# async def fetch_model(request: Request):
+#     data = await request.json()  # 获取 POST 请求的 JSON 数据
 
-    # 获取 DAG_ID 和 EXECUTION_ID
-    dag_id = data.get("DAG_ID")
-    execution_id = data.get("EXECUTION_ID")
-    download_url = data.get("model_download_url")
-    modelused_id = data.get("model")
-    inference_root_folder_name = data.get("inference_root_folder")
+#     # 获取 DAG_ID 和 EXECUTION_ID
+#     dag_id = data.get("DAG_ID")
+#     execution_id = data.get("EXECUTION_ID")
+#     download_url = data.get("model_download_url")
+#     modelused_id = data.get("model")
+#     inference_root_folder_name = data.get("inference_root_folder")
 
-    # 验证 DAG_ID 和 EXECUTION_ID 是否存在
-    if not dag_id or not execution_id:
-        raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
+#     # 验证 DAG_ID 和 EXECUTION_ID 是否存在
+#     if not dag_id or not execution_id:
+#         raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
 
-    # 获取 Logger 
-    logger = logger_manager.get_logger(dag_id, execution_id)
+#     # 获取 Logger 
+#     logger = logger_manager.get_logger(dag_id, execution_id)
     
-    logger.info("Received request to download model")
-    logger.info(f"Download URL: {download_url}")
+#     logger.info("Received request to download model")
+#     logger.info(f"Download URL: {download_url}")
 
-    # 构建目标路径
-    moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
-    root_folder_path = Path(moa_inference_folder)
-    save_directory = root_folder_path / f"inference_{modelused_id}" / "NCU-RSS-1.5" / "data" / "inference" / "saved_model_and_prediction"
-    logger.info(f"Save directory: {save_directory}")
+#     # 构建目标路径
+#     moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
+#     root_folder_path = Path(moa_inference_folder)
+#     save_directory = root_folder_path / f"inference_{modelused_id}" / "NCU-RSS-1.5" / "data" / "inference" / "saved_model_and_prediction"
+#     logger.info(f"Save directory: {save_directory}")
 
-    # 确保目标目录存在
-    save_directory.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Directory {save_directory} is ready")
+#     # 确保目标目录存在
+#     save_directory.mkdir(parents=True, exist_ok=True)
+#     logger.info(f"Directory {save_directory} is ready")
 
-    try:
-        # 使用流式下载处理大文件
-        with requests.get(download_url, stream=True) as r:
-            r.raise_for_status()
-            model_file_path = save_directory / "model.h5"
-            with open(model_file_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            logger.info(f"Model downloaded and saved to {model_file_path}")
-            logger.info(f"[inference]FetchModel finished for dag: {dag_id}_{execution_id}   !!!")
+#     try:
+#         # 使用流式下载处理大文件
+#         with requests.get(download_url, stream=True) as r:
+#             r.raise_for_status()
+#             model_file_path = save_directory / "model.h5"
+#             with open(model_file_path, "wb") as f:
+#                 for chunk in r.iter_content(chunk_size=8192):
+#                     f.write(chunk)
+#             logger.info(f"Model downloaded and saved to {model_file_path}")
+#             logger.info(f"[inference]FetchModel finished for dag: {dag_id}_{execution_id}   !!!")
 
-    except requests.RequestException as e:
-        logger.error(f"Request failed: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"An error occurred: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+#     except requests.RequestException as e:
+#         logger.error(f"Request failed: {e}")
+#         raise HTTPException(status_code=400, detail=str(e))
+#     except Exception as e:
+#         logger.error(f"An error occurred: {e}")
+#         raise HTTPException(status_code=500, detail=str(e))
 
-    return {"status": "success", "file_path": str(model_file_path)}
+#     return {"status": "success", "file_path": str(model_file_path)}
 
-@app.post("/INFERENCE/inference/GenerateParcelDatasetForInference")
-async def generate_parcel_dataset_for_inference(request: Request):
-    data = await request.json()  # 获取 POST 请求的 JSON 数据
+# @app.post("/INFERENCE/inference/GenerateParcelDatasetForInference")
+# async def generate_parcel_dataset_for_inference(request: Request):
+#     data = await request.json()  # 获取 POST 请求的 JSON 数据
 
-    # 获取 DAG_ID 和 EXECUTION_ID
-    dag_id = data.get("DAG_ID")
-    execution_id = data.get("EXECUTION_ID")
-    modelused_id = data.get("model")
-    inference_root_folder_name = data.get("inference_root_folder")
+#     # 获取 DAG_ID 和 EXECUTION_ID
+#     dag_id = data.get("DAG_ID")
+#     execution_id = data.get("EXECUTION_ID")
+#     modelused_id = data.get("model")
+#     inference_root_folder_name = data.get("inference_root_folder")
 
-    # 验证 DAG_ID 和 EXECUTION_ID 是否存在
-    if not dag_id or not execution_id:
-        raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
+#     # 验证 DAG_ID 和 EXECUTION_ID 是否存在
+#     if not dag_id or not execution_id:
+#         raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
 
-    # 获取 Logger 和 DVCWorker
-    logger = logger_manager.get_logger(dag_id, execution_id)
-    dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
+#     # 获取 Logger 和 DVCWorker
+#     logger = logger_manager.get_logger(dag_id, execution_id)
+#     dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
 
-    logger.info("Received request to run script")
+#     logger.info("Received request to run script")
 
-    # 构建目标路径
-    moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
-    root_folder_path = Path(moa_inference_folder)
-    script_directory = root_folder_path / f"inference_{modelused_id}" / "NCU-RSS-1.5"
-    script_path = script_directory / "generate_parcel_dataset_for_inference.py"
-    log_directory = script_directory / "data" / "logs"
+#     # 构建目标路径
+#     moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
+#     root_folder_path = Path(moa_inference_folder)
+#     script_directory = root_folder_path / f"inference_{modelused_id}" / "NCU-RSS-1.5"
+#     script_path = script_directory / "generate_parcel_dataset_for_inference.py"
+#     log_directory = script_directory / "data" / "logs"
 
-    logger.info(f"Script path: {script_path}")
-    logger.info(f"Log directory: {log_directory}")
+#     logger.info(f"Script path: {script_path}")
+#     logger.info(f"Log directory: {log_directory}")
 
-    # 确保日志文件夹存在
-    if not log_directory.exists():
-        os.makedirs(log_directory)
-        logger.info(f"Created log directory: {log_directory}")
+#     # 确保日志文件夹存在
+#     if not log_directory.exists():
+#         os.makedirs(log_directory)
+#         logger.info(f"Created log directory: {log_directory}")
 
-    if not script_path.exists():
-        logger.error("Script file not found")
-        raise HTTPException(status_code=404, detail="Script file not found")
+#     if not script_path.exists():
+#         logger.error("Script file not found")
+#         raise HTTPException(status_code=404, detail="Script file not found")
 
-    try:
-        # 使用 subprocess 运行脚本，并捕获输出
-        result = subprocess.run(
-            ["python", str(script_path)],
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=str(script_directory)  # 设置工作目录为脚本目录
-        )
+#     try:
+#         # 使用 subprocess 运行脚本，并捕获输出
+#         result = subprocess.run(
+#             ["python", str(script_path)],
+#             capture_output=True,
+#             text=True,
+#             check=True,
+#             cwd=str(script_directory)  # 设置工作目录为脚本目录
+#         )
 
-        # 将脚本输出记录到日志
-        logger.info(f"Script output:\n{result.stdout}")
-        logger.error(f"Script errors:\n{result.stderr}")
+#         # 将脚本输出记录到日志
+#         logger.info(f"Script output:\n{result.stdout}")
+#         logger.error(f"Script errors:\n{result.stderr}")
         
-        logger.info(f"[inference]GenerateParcelDatasetForInference finished for dag: {dag_id}_{execution_id}   !!!")
-        return {"status": "success", "output": result.stdout, "errors": result.stderr}
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Script failed with error: {e.stderr}")
-        raise HTTPException(status_code=500, detail=f"Script failed with error: {e.stderr}")
-    except Exception as e:
-        logger.error(f"An error occurred: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+#         logger.info(f"[inference]GenerateParcelDatasetForInference finished for dag: {dag_id}_{execution_id}   !!!")
+#         return {"status": "success", "output": result.stdout, "errors": result.stderr}
+#     except subprocess.CalledProcessError as e:
+#         logger.error(f"Script failed with error: {e.stderr}")
+#         raise HTTPException(status_code=500, detail=f"Script failed with error: {e.stderr}")
+#     except Exception as e:
+#         logger.error(f"An error occurred: {str(e)}")
+#         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
-@app.post("/INFERENCE/inference/ExecuteInference")
-async def execute_inference(request: Request):
-    data = await request.json()
+# @app.post("/INFERENCE/inference/ExecuteInference")
+# async def execute_inference(request: Request):
+#     data = await request.json()
     
-    dag_id = data.get("DAG_ID")
-    execution_id = data.get("EXECUTION_ID")
+#     dag_id = data.get("DAG_ID")
+#     execution_id = data.get("EXECUTION_ID")
     
-    if not dag_id or not execution_id:
-        raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
+#     if not dag_id or not execution_id:
+#         raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
     
-    logger = logger_manager.get_logger(dag_id, execution_id)
+#     logger = logger_manager.get_logger(dag_id, execution_id)
     
-    logger.info("Received request to run inference script")
+#     logger.info("Received request to run inference script")
 
-    modelused_id = data.get("model")
+#     modelused_id = data.get("model")
 
-    # 构建目标路径
-    inference_root_folder_name = data.get("inference_root_folder")
-    moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
-    root_folder_path = Path(moa_inference_folder)
+#     # 构建目标路径
+#     inference_root_folder_name = data.get("inference_root_folder")
+#     moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
+#     root_folder_path = Path(moa_inference_folder)
 
-    # 构建目标路径
-    script_directory = root_folder_path / f"inference_{modelused_id}" / "NCU-RSS-1.5"
-    script_path = script_directory / "inference.py"
-    log_directory = script_directory / "data" / "logs"
+#     # 构建目标路径
+#     script_directory = root_folder_path / f"inference_{modelused_id}" / "NCU-RSS-1.5"
+#     script_path = script_directory / "inference.py"
+#     log_directory = script_directory / "data" / "logs"
 
-    logger.info(f"Script path: {script_path}")
-    logger.info(f"Log directory: {log_directory}")
+#     logger.info(f"Script path: {script_path}")
+#     logger.info(f"Log directory: {log_directory}")
 
-    # 确保日志文件夹存在
-    if not log_directory.exists():
-        log_directory.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Created log directory: {log_directory}")
+#     # 确保日志文件夹存在
+#     if not log_directory.exists():
+#         log_directory.mkdir(parents=True, exist_ok=True)
+#         logger.info(f"Created log directory: {log_directory}")
 
-    if not script_path.exists():
-        logger.error("Script file not found")
-        raise HTTPException(status_code=404, detail="Script file not found")
+#     if not script_path.exists():
+#         logger.error("Script file not found")
+#         raise HTTPException(status_code=404, detail="Script file not found")
 
-    try:
-        # 使用 subprocess 运行脚本，并捕获输出
-        result = subprocess.run(
-            ["python", str(script_path)],
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=str(script_directory)  # 设置工作目录为脚本目录
-        )
+#     try:
+#         # 使用 subprocess 运行脚本，并捕获输出
+#         result = subprocess.run(
+#             ["python", str(script_path)],
+#             capture_output=True,
+#             text=True,
+#             check=True,
+#             cwd=str(script_directory)  # 设置工作目录为脚本目录
+#         )
 
-        # 将脚本输出记录到日志
-        logger.info(f"Script output:\n{result.stdout}")
-        logger.error(f"Script errors:\n{result.stderr}")
-        logger.info(f"[inference]ExecuteInference finished for dag: {dag_id}_{execution_id}   !!!")
-        return {"status": "success", "output": result.stdout, "errors": result.stderr}
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Script failed with error: {e.stderr}")
-        raise HTTPException(status_code=500, detail=f"Script failed with error: {e.stderr}")
-    except Exception as e:
-        logger.error(f"An error occurred: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+#         # 将脚本输出记录到日志
+#         logger.info(f"Script output:\n{result.stdout}")
+#         logger.error(f"Script errors:\n{result.stderr}")
+#         logger.info(f"[inference]ExecuteInference finished for dag: {dag_id}_{execution_id}   !!!")
+#         return {"status": "success", "output": result.stdout, "errors": result.stderr}
+#     except subprocess.CalledProcessError as e:
+#         logger.error(f"Script failed with error: {e.stderr}")
+#         raise HTTPException(status_code=500, detail=f"Script failed with error: {e.stderr}")
+#     except Exception as e:
+#         logger.error(f"An error occurred: {str(e)}")
+#         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
     
-@app.post("/INFERENCE/inference/UploadInferenceOutputFiles")
-async def upload_inference_output_files(request: Request):
-    data = await request.json()
+# @app.post("/INFERENCE/inference/UploadInferenceOutputFiles")
+# async def upload_inference_output_files(request: Request):
+#     data = await request.json()
     
-    dag_id = data.get("DAG_ID")
-    execution_id = data.get("EXECUTION_ID")
+#     dag_id = data.get("DAG_ID")
+#     execution_id = data.get("EXECUTION_ID")
 
-    if not dag_id or not execution_id:
-        raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
+#     if not dag_id or not execution_id:
+#         raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
     
-    logger = logger_manager.get_logger(dag_id, execution_id)
-    dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
+#     logger = logger_manager.get_logger(dag_id, execution_id)
+#     dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
 
-    logger.info("Received request to upload files")
+#     logger.info("Received request to upload files")
 
-    modelused_id = data.get("model")
+#     modelused_id = data.get("model")
 
-    # 构建目标路径
-    inference_root_folder_name = data.get("inference_root_folder")
-    moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
-    root_folder_path = Path(moa_inference_folder)
+#     # 构建目标路径
+#     inference_root_folder_name = data.get("inference_root_folder")
+#     moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
+#     root_folder_path = Path(moa_inference_folder)
 
-    # 构建源路径和 DVC 文件路径
-    source_directory = root_folder_path / f"inference_{modelused_id}" / "NCU-RSS-1.5" / "data" / "inference" / "saved_model_and_prediction" / "model"
+#     # 构建源路径和 DVC 文件路径
+#     source_directory = root_folder_path / f"inference_{modelused_id}" / "NCU-RSS-1.5" / "data" / "inference" / "saved_model_and_prediction" / "model"
 
-    # 注意：按照原脚本产生名为 "model" 的文件夹
-    folder_name = f"model"
+#     # 注意：按照原脚本产生名为 "model" 的文件夹
+#     folder_name = f"model"
     
-    logger.info(f"Source directory: {source_directory}")
-    logger.info(f"DVC folder name: {folder_name}")
+#     logger.info(f"Source directory: {source_directory}")
+#     logger.info(f"DVC folder name: {folder_name}")
 
-    if not source_directory.exists():
-        logger.error("Source directory not found")
-        raise HTTPException(status_code=404, detail="Source directory not found")
+#     if not source_directory.exists():
+#         logger.error("Source directory not found")
+#         raise HTTPException(status_code=404, detail="Source directory not found")
 
-    try:
-        dvc_repo = source_directory.parent
-        init_result = dvc_worker.initialize_dvc(dvc_repo)
-        if init_result["status"] == "error":
-            logger.error(f"Failed to initialize DVC: {init_result['message']}")
-            raise HTTPException(status_code=500, detail=init_result["message"])
+#     try:
+#         dvc_repo = source_directory.parent
+#         init_result = dvc_worker.initialize_dvc(dvc_repo)
+#         if init_result["status"] == "error":
+#             logger.error(f"Failed to initialize DVC: {init_result['message']}")
+#             raise HTTPException(status_code=500, detail=init_result["message"])
         
-        # 使用 DVCWorker 将文件夹添加到 DVC 并推送到远程存储
-        result = dvc_worker.add_and_push_data(str(source_directory), folder_name)
-        if result["status"] == "error":
-            logger.error(f"Failed to upload data: {result['message']}")
-            raise HTTPException(status_code=500, detail=f"Failed to upload data: {result['message']}")
+#         # 使用 DVCWorker 将文件夹添加到 DVC 并推送到远程存储
+#         result = dvc_worker.add_and_push_data(str(source_directory), folder_name)
+#         if result["status"] == "error":
+#             logger.error(f"Failed to upload data: {result['message']}")
+#             raise HTTPException(status_code=500, detail=f"Failed to upload data: {result['message']}")
 
-        logger.info(f"Files uploaded successfully with DVC management for {folder_name}")
+#         logger.info(f"Files uploaded successfully with DVC management for {folder_name}")
 
-        logger.info(f"[inference]UploadInferenceOutputFiles finished for dag: {dag_id}_{execution_id}   !!!")
+#         logger.info(f"[inference]UploadInferenceOutputFiles finished for dag: {dag_id}_{execution_id}   !!!")
 
-        return {"status": "success", "message": f"Files uploaded successfully with DVC management for {folder_name}"}
-    except Exception as e:
-        logger.error(f"An error occurred during upload: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+#         return {"status": "success", "message": f"Files uploaded successfully with DVC management for {folder_name}"}
+#     except Exception as e:
+#         logger.error(f"An error occurred during upload: {str(e)}")
+#         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
-@app.post("/INFERENCE/postprocessing/DownloadInferenceOutputFiles")
-async def download_inference_output_files(request: Request):
-    data = await request.json()
+# @app.post("/INFERENCE/postprocessing/DownloadInferenceOutputFiles")
+# async def download_inference_output_files(request: Request):
+#     data = await request.json()
     
-    dag_id = data.get("DAG_ID")
-    execution_id = data.get("EXECUTION_ID")
+#     dag_id = data.get("DAG_ID")
+#     execution_id = data.get("EXECUTION_ID")
 
-    if not dag_id or not execution_id:
-        raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
+#     if not dag_id or not execution_id:
+#         raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
     
-    logger = logger_manager.get_logger(dag_id, execution_id)
-    dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
+#     logger = logger_manager.get_logger(dag_id, execution_id)
+#     dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
 
-    logger.info("Received request to download files")
+#     logger.info("Received request to download files")
 
-    # 构建目标路径
-    inference_root_folder_name = data.get("inference_root_folder")
-    moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
-    root_folder_path = Path(moa_inference_folder)
+#     # 构建目标路径
+#     inference_root_folder_name = data.get("inference_root_folder")
+#     moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
+#     root_folder_path = Path(moa_inference_folder)
 
-    # 构建目标路径和 DVC 文件路径
-    destination_directory = root_folder_path / "IMG"
-    temp_postprocessing_download_directory = root_folder_path / "NCU-RSS-Predict-Postprocessing" / "temp_postprocessing_download"
-    temp_postprocessing_download_directory.mkdir(parents=True, exist_ok=True)
+#     # 构建目标路径和 DVC 文件路径
+#     destination_directory = root_folder_path / "IMG"
+#     temp_postprocessing_download_directory = root_folder_path / "NCU-RSS-Predict-Postprocessing" / "temp_postprocessing_download"
+#     temp_postprocessing_download_directory.mkdir(parents=True, exist_ok=True)
 
-    dvc_filename = "model.dvc"
+#     dvc_filename = "model.dvc"
 
-    logger.info(f"Temporary directory: {temp_postprocessing_download_directory}")
-    logger.info(f"DVC file name: {dvc_filename}")
+#     logger.info(f"Temporary directory: {temp_postprocessing_download_directory}")
+#     logger.info(f"DVC file name: {dvc_filename}")
 
-    if not destination_directory.exists():
-        logger.error("Destination directory not found")
-        raise HTTPException(status_code=404, detail="Destination directory not found")
+#     if not destination_directory.exists():
+#         logger.error("Destination directory not found")
+#         raise HTTPException(status_code=404, detail="Destination directory not found")
 
-    try:
-        # 使用 DVCWorker 从远程存储拉取文件到临时目录
-        pull_result = dvc_worker.pull(dvc_filename, str(temp_postprocessing_download_directory))
+#     try:
+#         # 使用 DVCWorker 从远程存储拉取文件到临时目录
+#         pull_result = dvc_worker.pull(dvc_filename, str(temp_postprocessing_download_directory))
         
-        if pull_result["status"] == "error":
-            logger.error(f"Failed to pull data: {pull_result['stderr']}")
-            raise HTTPException(status_code=500, detail=f"Failed to pull data: {pull_result['stderr']}")
+#         if pull_result["status"] == "error":
+#             logger.error(f"Failed to pull data: {pull_result['stderr']}")
+#             raise HTTPException(status_code=500, detail=f"Failed to pull data: {pull_result['stderr']}")
 
-        # 如果目标目录已经存在，先删除
-        if destination_directory.exists():
-            shutil.rmtree(destination_directory)
-            if destination_directory.exists():
-                logger.error(f"Failed to delete {destination_directory}")
-                raise HTTPException(status_code=500, detail=f"Failed to delete {destination_directory}")
+#         # 如果目标目录已经存在，先删除
+#         if destination_directory.exists():
+#             shutil.rmtree(destination_directory)
+#             if destination_directory.exists():
+#                 logger.error(f"Failed to delete {destination_directory}")
+#                 raise HTTPException(status_code=500, detail=f"Failed to delete {destination_directory}")
         
-        # 重命名临时目录为目标目录
-        temp_postprocessing_download_content_folder = temp_postprocessing_download_directory / "model"
-        if temp_postprocessing_download_content_folder.exists():
-            temp_postprocessing_download_content_folder.rename(destination_directory)
-            logger.info(f"Renamed {temp_postprocessing_download_content_folder} to {destination_directory}")
-            if not destination_directory.exists():
-                logger.error(f"Failed to rename folder to {destination_directory}")
-                raise HTTPException(status_code=500, detail=f"Failed to rename folder to {destination_directory}")
+#         # 重命名临时目录为目标目录
+#         temp_postprocessing_download_content_folder = temp_postprocessing_download_directory / "model"
+#         if temp_postprocessing_download_content_folder.exists():
+#             temp_postprocessing_download_content_folder.rename(destination_directory)
+#             logger.info(f"Renamed {temp_postprocessing_download_content_folder} to {destination_directory}")
+#             if not destination_directory.exists():
+#                 logger.error(f"Failed to rename folder to {destination_directory}")
+#                 raise HTTPException(status_code=500, detail=f"Failed to rename folder to {destination_directory}")
 
-        logger.info(f"Files downloaded and renamed to {destination_directory}")
-        logger.info(f"[postprocessing]DownloadInferenceOutputFiles finished for dag: {dag_id}_{execution_id}   !!!")
-        return {"status": "success", "message": f"Files downloaded and renamed to {destination_directory}"}
-    except Exception as e:
-        logger.error(f"An error occurred during download: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+#         logger.info(f"Files downloaded and renamed to {destination_directory}")
+#         logger.info(f"[postprocessing]DownloadInferenceOutputFiles finished for dag: {dag_id}_{execution_id}   !!!")
+#         return {"status": "success", "message": f"Files downloaded and renamed to {destination_directory}"}
+#     except Exception as e:
+#         logger.error(f"An error occurred during download: {str(e)}")
+#         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
-@app.post("/INFERENCE/postprocessing/UpdatePostprocessingConfig")
-async def update_Postprocessing_config(request: Request):
-    data = await request.json()
+# @app.post("/INFERENCE/postprocessing/UpdatePostprocessingConfig")
+# async def update_Postprocessing_config(request: Request):
+#     data = await request.json()
     
-    dag_id = data.get("DAG_ID")
-    execution_id = data.get("EXECUTION_ID")
+#     dag_id = data.get("DAG_ID")
+#     execution_id = data.get("EXECUTION_ID")
 
-    if not dag_id or not execution_id:
-        raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
+#     if not dag_id or not execution_id:
+#         raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
     
-    logger = logger_manager.get_logger(dag_id, execution_id)
+#     logger = logger_manager.get_logger(dag_id, execution_id)
 
-    logger.info("Received request to update config file")
+#     logger.info("Received request to update config file")
     
-    # 构建目标路径
-    inference_root_folder_name = data.get("inference_root_folder")
-    moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
-    root_folder_path = Path(moa_inference_folder)
-    TIF_folder_path = data["TIF_Path"]
-    SHP_folder_path = data["SHP_Path"]
+#     # 构建目标路径
+#     inference_root_folder_name = data.get("inference_root_folder")
+#     moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
+#     root_folder_path = Path(moa_inference_folder)
+#     TIF_folder_path = data["TIF_Path"]
+#     SHP_folder_path = data["SHP_Path"]
 
-    # 构建config.py文件路径
-    config_path = root_folder_path / "NCU-RSS-Predict-Postprocessing" / "configs" / "config.py"
+#     # 构建config.py文件路径
+#     config_path = root_folder_path / "NCU-RSS-Predict-Postprocessing" / "configs" / "config.py"
 
-    logger.info(f"Config file path: {config_path}")
+#     logger.info(f"Config file path: {config_path}")
 
-    if not config_path.exists():
-        logger.error("Config file not found")
-        raise HTTPException(status_code=404, detail="Config file not found")
+#     if not config_path.exists():
+#         logger.error("Config file not found")
+#         raise HTTPException(status_code=404, detail="Config file not found")
 
-    try:
-        # 读取config.py文件
-        with open(config_path, "r", encoding="utf-8") as file:
-            config_content = file.read()
+#     try:
+#         # 读取config.py文件
+#         with open(config_path, "r", encoding="utf-8") as file:
+#             config_content = file.read()
 
-        # 更新config.py内容
-        config_content = config_content.replace(r'SHP_Path = r"\SHP"', f'SHP_Path = r"{SHP_folder_path}"')
-        config_content = config_content.replace(r'TIF_Path = r"\TIF"', f'TIF_Path = r"{TIF_folder_path}"')
-        img_path = root_folder_path / "IMG"
-        config_content = config_content.replace(r'IMG_Path = r"\IMG"', f'IMG_Path = r"{img_path}"')
-        directory_path = root_folder_path / "NCU-RSS-Predict-Postprocessing"
-        config_content = config_content.replace(r'directory = r"D:\testMOA\NCU-RSS-Predict-Postprocessing"', f'directory = r"{directory_path }"')
+#         # 更新config.py内容
+#         config_content = config_content.replace(r'SHP_Path = r"\SHP"', f'SHP_Path = r"{SHP_folder_path}"')
+#         config_content = config_content.replace(r'TIF_Path = r"\TIF"', f'TIF_Path = r"{TIF_folder_path}"')
+#         img_path = root_folder_path / "IMG"
+#         config_content = config_content.replace(r'IMG_Path = r"\IMG"', f'IMG_Path = r"{img_path}"')
+#         directory_path = root_folder_path / "NCU-RSS-Predict-Postprocessing"
+#         config_content = config_content.replace(r'directory = r"D:\testMOA\NCU-RSS-Predict-Postprocessing"', f'directory = r"{directory_path }"')
 
-        # 写回config.py文件
-        with open(config_path, "w", encoding="utf-8") as file:
-            file.write(config_content)
+#         # 写回config.py文件
+#         with open(config_path, "w", encoding="utf-8") as file:
+#             file.write(config_content)
 
-        logger.info("Config file updated successfully")
-        logger.info(f"[postprocessing]UpdatePostprocessingConfig finished for dag: {dag_id}_{execution_id}   !!!")
-        return {"status": "success"}
-    except Exception as e:
-        logger.error(f"An error occurred: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+#         logger.info("Config file updated successfully")
+#         logger.info(f"[postprocessing]UpdatePostprocessingConfig finished for dag: {dag_id}_{execution_id}   !!!")
+#         return {"status": "success"}
+#     except Exception as e:
+#         logger.error(f"An error occurred: {str(e)}")
+#         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
-@app.post("/INFERENCE/postprocessing/ExecutePostprocessing")
-async def execute_postprocessing(request: Request):
-    data = await request.json()
+# @app.post("/INFERENCE/postprocessing/ExecutePostprocessing")
+# async def execute_postprocessing(request: Request):
+#     data = await request.json()
     
-    dag_id = data.get("DAG_ID")
-    execution_id = data.get("EXECUTION_ID")
+#     dag_id = data.get("DAG_ID")
+#     execution_id = data.get("EXECUTION_ID")
 
-    if not dag_id or not execution_id:
-        raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
+#     if not dag_id or not execution_id:
+#         raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
     
-    logger = logger_manager.get_logger(dag_id, execution_id)
-    dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
+#     logger = logger_manager.get_logger(dag_id, execution_id)
+#     dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
 
-    logger.info("Received request to execute postprocessing script")
+#     logger.info("Received request to execute postprocessing script")
 
-    # 构建推理根文件夹路径
-    inference_root_folder_name = data.get("inference_root_folder")
-    moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
-    root_folder_path = Path(moa_inference_folder)
+#     # 构建推理根文件夹路径
+#     inference_root_folder_name = data.get("inference_root_folder")
+#     moa_inference_folder = Path.home() / "Desktop" / inference_root_folder_name
+#     root_folder_path = Path(moa_inference_folder)
 
-    # 构建 main.py 文件路径
-    script_directory = root_folder_path / "NCU-RSS-Predict-Postprocessing"
-    script_path = script_directory / "main.py"
-    python_executable = r"C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe"
+#     # 构建 main.py 文件路径
+#     script_directory = root_folder_path / "NCU-RSS-Predict-Postprocessing"
+#     script_path = script_directory / "main.py"
+#     python_executable = r"C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe"
 
-    logger.info(f"Script path: {script_path}")
+#     logger.info(f"Script path: {script_path}")
 
-    if not script_path.exists():
-        logger.error("Script file not found")
-        raise HTTPException(status_code=404, detail="Script file not found")
+#     if not script_path.exists():
+#         logger.error("Script file not found")
+#         raise HTTPException(status_code=404, detail="Script file not found")
 
-    try:
-        # 使用 subprocess 运行脚本，并捕获输出
-        result = subprocess.run(
-            [python_executable, str(script_path)],
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=str(script_directory)  # 设置工作目录为脚本目录
-        )
+#     try:
+#         # 使用 subprocess 运行脚本，并捕获输出
+#         result = subprocess.run(
+#             [python_executable, str(script_path)],
+#             capture_output=True,
+#             text=True,
+#             check=True,
+#             cwd=str(script_directory)  # 设置工作目录为脚本目录
+#         )
 
-        # 将脚本输出记录到日志
-        logger.info(f"Script output:\n{result.stdout}")
-        if result.stderr:
-            logger.error(f"Script errors:\n{result.stderr}")
+#         # 将脚本输出记录到日志
+#         logger.info(f"Script output:\n{result.stdout}")
+#         if result.stderr:
+#             logger.error(f"Script errors:\n{result.stderr}")
 
-        logger.info(f"[postprocessing]ExecutePostprocessing finished for dag: {dag_id}_{execution_id}   !!!")
+#         logger.info(f"[postprocessing]ExecutePostprocessing finished for dag: {dag_id}_{execution_id}   !!!")
 
-        return {"status": "success", "output": result.stdout, "errors": result.stderr}
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Script failed with error: {e.stderr}")
-        raise HTTPException(status_code=500, detail=f"Script failed with error: {e.stderr}")
-    except Exception as e:
-        logger.error(f"An error occurred: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
-
+#         return {"status": "success", "output": result.stdout, "errors": result.stderr}
+#     except subprocess.CalledProcessError as e:
+#         logger.error(f"Script failed with error: {e.stderr}")
+#         raise HTTPException(status_code=500, detail=f"Script failed with error: {e.stderr}")
+#     except Exception as e:
+#         logger.error(f"An error occurred: {str(e)}")
+#         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+# '''
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("MachineServer:app", host=MACHINE_IP, port=MACHINE_PORT, reload=True)
