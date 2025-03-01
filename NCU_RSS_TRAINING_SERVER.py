@@ -22,6 +22,7 @@ from DagManager import DagManager
 from fastapi.responses import JSONResponse
 import yaml  # 解析 DVC 檔案
 import shutil
+import re  # 引入正則表達式套件
 
 from minio import Minio
 from minio.error import S3Error
@@ -260,11 +261,9 @@ async def setup_folders_for_training(request: DagRequest):
                 raise Exception("GITHUB_TOKEN not found in environment variables.")
 
             # 使用 subprocess.run() 執行 git clone 指令
-            clone_command = [
-                "git", "clone", 
-                f"https://{github_token}@github.com/chen88088/NCU-RSS-1.5.git", 
-                repo_training_path
-            ]
+            # **修正：直接內嵌 GITHUB_TOKEN 到 URL 中**
+            repo_url = f"https://{github_token}:x-oauth-basic@github.com/chen88088/NCU-RSS-1.5.git"
+            clone_command = ["git", "clone", repo_url, repo_training_path]
             result = subprocess.run(clone_command, capture_output=True, text=True)
             
             # 紀錄輸出與錯誤訊息
@@ -479,9 +478,16 @@ async def execute_training_scripts(request: DagRequest):
         raise HTTPException(status_code=400, detail=f"No image found for TASK_STAGE_TYPE: {task_stage_type}")
     
     v1 = init_k8s_client()
+    batch_v1 = client.BatchV1Api()  # 初始化 Batch API 用於創建 Job
     
-    # Pod 名稱
-    pod_name = f"task-pod-{uuid.uuid4().hex[:6]}"
+    # # Pod 名稱
+    # pod_name = f"{dag_id}-{execution_id}-{task_stage_type}-task-pod-{uuid.uuid4().hex[:6]}"
+
+    # Job 名稱
+    raw_job_name = f"task-job-{dag_id}-{execution_id}-{task_stage_type}-{uuid.uuid4().hex[:6]}"
+    # 將 _ 換成 -，轉小寫，並移除不合法字元
+    job_name = re.sub(r'[^a-z0-9\-]+', '', raw_job_name.lower().replace('_', '-'))
+
     
     # 確保 PVC_NAME 環境變量已設定
     pvc_name = os.getenv("PVC_NAME")
@@ -499,60 +505,72 @@ async def execute_training_scripts(request: DagRequest):
     ]
 
     # 組合成 Command
-    command = " && ".join([f"cd {working_dir}"] + scripts_to_run)
+    command = " && ".join([f"cd {working_dir}"] + scripts_to_run )
     
-    # 建立 Pod Manifest
-    pod_manifest = {
-        "apiVersion": "v1",
-        "kind": "Pod",
+    # **正確的 Job Manifest**
+    job_manifest = {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
         "metadata": {
-            "name": pod_name, 
+            "name": job_name,
             "namespace": "ml-serving",
             "labels": {
-                "app": "task-pod",
+                "app": "task-job",
                 "type": "gpu"
             }
         },
         "spec": {
-            "nodeSelector": {
-                "gpu-node": "true"
-            },
-            "containers": [
-                {
-                    "name": "task-container",
-                    "image": f"harbor.pdc.tw/{image_name}",
-                    "command": ["/bin/bash", "-c", command],
-                    "volumeMounts": [
+            "backoffLimit": 3,
+            # **TTLAfterFinished: 完成後 60 秒自動刪除**
+            "ttlSecondsAfterFinished": 60,
+            "template": {
+                "metadata": {
+                    "name": job_name
+                },
+                "spec": {
+                    "nodeSelector": {
+                        "gpu-node": "true"
+                    },
+                    "restartPolicy": "Never",
+                    "containers": [
                         {
-                            "name": "shared-storage",
-                            "mountPath": "/mnt/storage"
+                            "name": "task-container",
+                            "image": f"harbor.pdc.tw/{image_name}",
+                            "command": ["/bin/bash", "-c", command],
+                            "volumeMounts": [
+                                {
+                                    "name": "shared-storage",
+                                    "mountPath": "/mnt/storage"
+                                }
+                            ],
+                            "resources": {
+                                "limits": {
+                                    "nvidia.com/gpu": "1"
+                                }
+                            }
                         }
                     ],
-                    "resources": {
-                        "limits": {
-                            "nvidia.com/gpu": "1"  # 限制 GPU 使用量
+                    "volumes": [
+                        {
+                            "name": "shared-storage",
+                            "persistentVolumeClaim": {
+                                "claimName": pvc_name
+                            }
                         }
-                    }
+                    ]
                 }
-            ],
-            "volumes": [
-                {
-                    "name": "shared-storage",
-                    "persistentVolumeClaim": {
-                        "claimName": pvc_name
-                    }
-                }
-            ],
-            "restartPolicy": "Never"  # 執行完成後不會重啟
+            }
         }
     }
     
-    # 建立 Pod
+    # 建立 Job
     try:
-        v1.create_namespaced_pod(namespace="ml-serving", body=pod_manifest)
-        return {"status": "success", "message": "Task Pod created", "pod_name": pod_name}
+        batch_v1.create_namespaced_job(namespace="ml-serving", body=job_manifest)
+        return {"status": "success", "message": "Task Job created", "job_name": job_name}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to create Task Pod: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create Task Job: {str(e)}")
+
+
 
 #########################################################################
 
