@@ -24,9 +24,14 @@ import yaml  # 解析 DVC 檔案
 import shutil
 import re  # 引入正則表達式套件
 
+import mlflow
+import pandas as pd
+
 from minio import Minio
 from minio.error import S3Error
 import uuid
+
+import time
 
 # 设置基本的日志配置
 logging.basicConfig(level=logging.DEBUG)
@@ -289,7 +294,6 @@ async def setup_folders_for_training(request: DagRequest):
         logger.error(f"An error occurred: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     
-
 # 下載 dvc_file 的 result.dvc
 def download_dvc_file(minio_client, target_folder):
     dvc_folder = os.path.join(target_folder, "dvc_file")
@@ -496,12 +500,13 @@ async def execute_training_scripts(request: DagRequest):
     
     # 組合工作目錄
     working_dir = f"/mnt/storage/{dag_id}_{execution_id}/NCU-RSS-1.5"
+    output_dir = f"{working_dir}/data/train_test/For_training_testing/320x320/train_test"
     
     # 定義要執行的腳本
     scripts_to_run = [
         "python3 kmeans_cluster_for_train_test.py",
         "python3 random_sampling_for_parcel_dataset_for_train_test.py",
-        "python3 train_and_val_model.py"
+        "python3 train_and_val_model_with_excel.py"
     ]
 
     # 組合成 Command
@@ -566,10 +571,70 @@ async def execute_training_scripts(request: DagRequest):
     # 建立 Job
     try:
         batch_v1.create_namespaced_job(namespace="ml-serving", body=job_manifest)
+
+        # **等待 Job 完成**
+        wait_for_job_completion(batch_v1, job_name, "ml-serving")
+
+        record_mlflow(request, output_dir)
         return {"status": "success", "message": "Task Job created", "job_name": job_name}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create Task Job: {str(e)}")
 
+def wait_for_job_completion(batch_v1, job_name, namespace, timeout=3600):
+    """
+    監聽 K8s Job 狀態，等待 Job 執行完成
+    """
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        job_status = batch_v1.read_namespaced_job_status(job_name, namespace)
+        if job_status.status.succeeded == 1:
+            print(f"Job {job_name} completed successfully.")
+            return
+        elif job_status.status.failed is not None and job_status.status.failed > 0:
+            raise Exception(f"Job {job_name} failed.")
+        time.sleep(10)  # 每 10 秒檢查一次 Job 狀態
+
+
+def record_mlflow(request: DagRequest, output_dir: str):
+    """ 記錄執行結果到 MLflow """
+    os.environ["AWS_ACCESS_KEY_ID"] = os.getenv("AWS_ACCESS_KEY_ID", "default-key")
+    os.environ["AWS_SECRET_ACCESS_KEY"] = os.getenv("AWS_SECRET_ACCESS_KEY", "default-secret")
+    os.environ["MLFLOW_S3_ENDPOINT_URL"] = os.getenv("MLFLOW_S3_ENDPOINT_URL", "http://localhost:9000")
+
+    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI"))
+    mlflow.set_experiment(request.DAG_ID)
+    dag_instance_unique_id = f'{request.DAG_ID}_{request.EXECUTION_ID}'
+    with mlflow.start_run(run_name=dag_instance_unique_id):
+        # 記錄 Request Body 為 Tags
+        mlflow.set_tags(request.model_dump())
+        
+        # 讀取 Excel 內容
+        excel_path = os.path.join(output_dir, "training_results.xlsx")
+        df_params = pd.read_excel(excel_path, sheet_name="Parameters")
+        df_metrics = pd.read_excel(excel_path, sheet_name="Metrics")
+        
+        # 記錄 Parameters
+        params = df_params.iloc[0].to_dict()
+        for key, value in params.items():
+            mlflow.log_param(key, value)
+        
+        # 記錄 Metrics
+        for index, row in df_metrics.iterrows():
+            mlflow.log_metrics({
+                "train_accuracy": row["train_accuracy"],
+                "val_accuracy": row["val_accuracy"],
+                "train_loss": row["train_loss"],
+                "val_loss": row["val_loss"],
+                "train_kappa": row["train_kappa"],
+                "val_kappa": row["val_kappa"]
+            }, step=index)
+        
+        # 上傳 Artifact
+        mlflow.log_artifact(os.path.join(output_dir, "final_weight.h5"))
+        mlflow.log_artifact(os.path.join(output_dir, "model.h5"))
+        mlflow.log_artifact(os.path.join(output_dir, "model_val_acc.h5"))
+        mlflow.log_artifact(os.path.join(output_dir, "val_acc.png"))
+        mlflow.log_artifact(excel_path)
 
 
 #########################################################################
