@@ -32,6 +32,7 @@ from minio.error import S3Error
 import uuid
 
 import time
+import json
 
 # 设置基本的日志配置
 logging.basicConfig(level=logging.DEBUG)
@@ -128,7 +129,6 @@ def create_folder_if_not_exists(folder_path):
     if not os.path.exists(folder_path):
         os.makedirs(folder_path)
 
-
 # MinIO 客戶端初始化
 def init_minio_client():
     return Minio(
@@ -145,6 +145,12 @@ def parse_dvc_file(dvc_file_path):
         outs = dvc_data.get("outs", [])
         dataset_paths = [item['path'] for item in outs]
         return dataset_paths
+    
+# 初始化 Kubernetes 客戶端
+def init_k8s_client():
+    # 若在 K8s Cluster 內執行，則使用 In-Cluster Config
+    config.load_incluster_config()
+    return client.CoreV1Api()
 
 # 實例化 LoggerManager
 logger_manager = LoggerManager()
@@ -156,26 +162,6 @@ dag_manager = DagManager(logger_manager)
 @app.get("/health", status_code=200)
 async def health_check():
     return JSONResponse(content={"status": "NCURSS_TRAINING_MLServingPod is healthy"})
-
-# # 創建資料夾 API
-# @app.post("/create_folder", status_code=201)
-# async def create_folder(request: CreateFolderRequest):
-#     # 組合資料夾名稱
-#     folder_name = f"{request.dag_id}_{request.execution_id}"
-#     folder_path = os.path.join(STORAGE_PATH, folder_name)
-
-#     # 檢查資料夾是否已存在
-#     if os.path.exists(folder_path):
-#         raise HTTPException(status_code=400, detail="Folder already exists.")
-
-#     try:
-#         # 創建資料夾
-#         os.makedirs(folder_path)
-#         return {"message": "Folder created", "path": folder_path}
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Failed to create folder: {str(e)}")
-
-# API: 註冊 DAG 並初始化 Logger 和 DVC Worker
 
 # [Training/RegisterDag]
 @app.post("/Training/RegisterDag")
@@ -215,6 +201,16 @@ async def register_dag_and_logger_and_dvc_worker(request: DagRequest):
     create_folder_if_not_exists(git_local_repo_for_dvc)
     dvc_manager.init_worker(dag_id=dag_id, execution_id=execution_id, git_repo_path=git_local_repo_for_dvc)
 
+    # 獲取 Logger 和 DVCWorker
+    logger = logger_manager.get_logger(dag_id, execution_id)
+    logger.info("**********[Training/RegisterDag]**********")
+
+    # **打印請求的 request body**
+    request_dict = request.model_dump()
+    logger.info(f"Received request body:\n{json.dumps(request_dict, indent=4)}")
+
+    logger.info(f"DAG, Logger, and DVCWorker initialized for DAG_ID: {dag_id}, EXECUTION_ID: {execution_id}")
+
     return {"status": "success", "message": f"DAG, Logger, and DVCWorker initialized for DAG_ID: {dag_id}, EXECUTION_ID: {execution_id}"}
 
 # [Training/SetupFolder]
@@ -230,9 +226,16 @@ async def setup_folders_for_training(request: DagRequest):
     if not dag_id or not execution_id:
         raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
     
+    # 獲取 Logger 和 DVCWorker
+    logger = logger_manager.get_logger(dag_id, execution_id)
+    dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
+    
+    logger.info("**********[Training/SetupFolder]**********")
+    
     # 檢查 PVC 掛載狀態
     if not is_pvc_mounted():
         raise HTTPException(status_code=500, detail="PVC is not mounted.")
+    logger.info("PVC IS MOUNTED!!!!")
 
     # 組合路徑：/mnt/storage/{dag_id}_{execution_id}
     dag_root_folder_path = os.path.join(STORAGE_PATH, f"{dag_id}_{execution_id}")
@@ -242,9 +245,6 @@ async def setup_folders_for_training(request: DagRequest):
     if not os.path.exists(dag_root_folder_path):
         raise HTTPException(status_code=404, detail="dag_root_folder was not created")
 
-    # 獲取 Logger 和 DVCWorker
-    logger = logger_manager.get_logger(dag_id, execution_id)
-    dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
 
     # 從 CODE_REPO_URL 中獲取對應的 Repo URL
     code_repo_url = request.CODE_REPO_URL.get(task_stage_type)
@@ -293,121 +293,6 @@ async def setup_folders_for_training(request: DagRequest):
     except Exception as e:
         logger.error(f"An error occurred: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-    
-# 下載 dvc_file 的 result.dvc
-def download_dvc_file(minio_client, target_folder):
-    dvc_folder = os.path.join(target_folder, "dvc_file")
-    create_folder_if_not_exists(dvc_folder)
-    dvc_file_path = os.path.join(dvc_folder, "result.dvc")
-    
-    try:
-        # 下載 result.dvc
-        minio_client.fget_object(BUCKET_NAME, "dvc_file/result.dvc", dvc_file_path)
-        print(f"Downloaded: dvc_file/result.dvc -> {dvc_file_path}")
-    except S3Error as e:
-        raise HTTPException(status_code=500, detail=f"MinIO Error: {str(e)}")
-
-# 使用 DVC Pull 下載 dataset
-def download_dataset_with_dvc(target_folder):
-    dvc_folder = os.path.join(target_folder, "dvc_file")
-    os.chdir(dvc_folder)
-    
-    # 初始化 Git 與 DVC（如果尚未初始化）
-    if not os.path.exists(os.path.join(dvc_folder, ".git")):
-        subprocess.run(["git", "init"])
-        print("Initialized Git repository.")
-    if not os.path.exists(os.path.join(dvc_folder, ".dvc")):
-        subprocess.run(["dvc", "init", "--no-scm"])
-        print("Initialized DVC repository.")
-
-    # 設定 DVC 遠端為 MinIO
-    remote_name = "minio"
-    minio_url = f"s3://{BUCKET_NAME}/dataset"
-    subprocess.run(["dvc", "remote", "add", "-f", remote_name, minio_url])
-    subprocess.run(["dvc", "remote", "modify", remote_name, "access_key_id", MINIO_ACCESS_KEY])
-    subprocess.run(["dvc", "remote", "modify", remote_name, "secret_access_key", MINIO_SECRET_KEY])
-    subprocess.run(["dvc", "remote", "modify", remote_name, "endpointurl", f"http://{MINIO_URL}"])
-    
-    # **設定 DVC 預設遠端**
-    subprocess.run(["dvc", "remote", "default", remote_name])
-    print(f"Set DVC default remote: {remote_name}")
-
-    # DVC Pull
-    result = subprocess.run(["dvc", "pull"], capture_output=True, text=True)
-    print("DVC Pull Output:", result.stdout)
-    print("DVC Pull Error:", result.stderr)
-    print("DVC Pull Completed")
-
-    # 檢查 DVC Pull 結果
-    if "failed to pull data from the cloud" in result.stderr:
-        raise HTTPException(status_code=500, detail="Failed to pull data from the cloud. Check if the cache is up to date.")
-    
-# 下載 excel_file 資料夾
-def download_excel_files(minio_client, target_folder):
-    excel_folder = os.path.join(target_folder, "excel_file")
-    create_folder_if_not_exists(excel_folder)
-    
-    try:
-        # 獲取 excel_file 資料夾中的所有檔案
-        objects = minio_client.list_objects(BUCKET_NAME, prefix="excel_file/", recursive=True)
-        for obj in objects:
-            object_name = obj.object_name
-            relative_path = object_name.replace("excel_file/", "")
-            object_path = os.path.join(excel_folder, relative_path)
-
-            # 創建目錄（如果不存在）
-            os.makedirs(os.path.dirname(object_path), exist_ok=True)
-
-            # 下載檔案
-            minio_client.fget_object(BUCKET_NAME, object_name, object_path)
-            print(f"Downloaded: {object_name} -> {object_path}")
-
-    except S3Error as e:
-        raise HTTPException(status_code=500, detail=f"MinIO Error: {str(e)}")
-
-# 重組資料夾結構
-def reorganize_data_folder(target_folder):
-    """
-    將 dvc_file/result 資料夾移動並重新命名
-    將 mapping.xlsx 移動到 train_test 資料夾中
-    """
-    # 原始資料夾
-    dvc_result_folder = os.path.join(target_folder, "dvc_file", "result")
-    excel_file = os.path.join(target_folder, "excel_file", "mapping.xlsx")
-
-    # 目標資料夾
-    target_result_folder = os.path.join(target_folder, "train_test", "For_training_testing", "320x320", "parcel_NIRRGA")
-    target_excel_folder = os.path.join(target_folder, "train_test")
-
-    # 移動並重新命名 result 資料夾
-    if os.path.exists(dvc_result_folder):
-        os.makedirs(target_result_folder, exist_ok=True)
-        
-        # **逐一移動檔案與資料夾**
-        for item in os.listdir(dvc_result_folder):
-            src_path = os.path.join(dvc_result_folder, item)
-            dest_path = os.path.join(target_result_folder, item)
-
-            # 若是目錄，則用 copytree
-            if os.path.isdir(src_path):
-                shutil.copytree(src_path, dest_path, dirs_exist_ok=True)
-            else:
-                # 若是檔案，則用 move
-                shutil.move(src_path, dest_path)
-        
-        # 刪除原本的 result 資料夾
-        shutil.rmtree(dvc_result_folder)
-        print(f"Moved and merged result folder to {target_result_folder}")
-    else:
-        print("No result folder to move.")
-
-    # 移動 mapping.xlsx 到 train_test 資料夾
-    if os.path.exists(excel_file):
-        os.makedirs(target_excel_folder, exist_ok=True)
-        shutil.move(excel_file, os.path.join(target_excel_folder, "mapping.xlsx"))
-        print(f"Moved mapping.xlsx to {target_excel_folder}")
-    else:
-        print("No mapping.xlsx to move.")
 
 # API: 下載資料集
 # [Training/DownloadDataset]
@@ -422,6 +307,10 @@ async def download_dataset(request: DagRequest):
     if not dag_id or not execution_id:
         raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
     
+    # 獲取 Logger 和 DVCWorker
+    logger = logger_manager.get_logger(dag_id, execution_id)
+    dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
+    
     # 檢查 PVC 掛載狀態
     if not is_pvc_mounted():
         raise HTTPException(status_code=500, detail="PVC is not mounted.")
@@ -430,21 +319,30 @@ async def download_dataset(request: DagRequest):
     target_folder = os.path.join(STORAGE_PATH, f"{dag_id}_{execution_id}", "NCU-RSS-1.5", "data")
     create_folder_if_not_exists(target_folder)
 
-    # 初始化 MinIO 客戶端
-    minio_client = init_minio_client()
+    
 
     try:
+        logger.info("**********[Training/DownloadDataset]**********")
+
+        # 初始化 MinIO 客戶端
+        minio_client = dvc_worker.init_minio_client()
+        logger.info("MinIO Client Initialization Succesffully")
+
         # 1. 下載 dvc_file 中的 result.dvc
-        download_dvc_file(minio_client, target_folder)
+        dvc_worker.download_dvc_file(minio_client, target_folder)
+        logger.info("Dataset .dvc File download successfully")
 
         # 2. 使用 DVC Pull 下載 dataset
-        download_dataset_with_dvc(target_folder)
-
+        dvc_worker.download_dataset_with_dvc(target_folder)
+        logger.info("Download Dataset with .dvc file successfully")
         # 3. 下載 excel_file 資料夾
-        download_excel_files(minio_client, target_folder)
-
+        dvc_worker.download_excel_files(minio_client, target_folder)
+        logger.info("Download Excel Files successfully")
         # **4. 重組資料夾結構**
-        reorganize_data_folder(target_folder)
+        dvc_worker.reorganize_data_folder(target_folder)
+        logger.info("Download Excel Files successfully")
+
+        logger.info(f"Dataset and Excel files downloaded to {target_folder}")
 
         return {"status": "success", "message": f"Dataset and Excel files downloaded to {target_folder}"}
 
@@ -460,12 +358,6 @@ async def modify_config(request: DagRequest):
     # pass
     return {"status": "success", "message": f"Config Mofification Successfully!!"}
 
-# 初始化 Kubernetes 客戶端
-def init_k8s_client():
-    # 若在 K8s Cluster 內執行，則使用 In-Cluster Config
-    config.load_incluster_config()
-    return client.CoreV1Api()
-
 # [Training/ExecuteTrainingScripts]
 @app.post("/Training/ExecuteTrainingScripts")
 async def execute_training_scripts(request: DagRequest):
@@ -480,6 +372,10 @@ async def execute_training_scripts(request: DagRequest):
     image_name = request.IMAGE_NAME.get(task_stage_type)
     if not image_name:
         raise HTTPException(status_code=400, detail=f"No image found for TASK_STAGE_TYPE: {task_stage_type}")
+    
+    # 獲取 Logger 和 DVCWorker
+    logger = logger_manager.get_logger(dag_id, execution_id)
+    logger.info("**********[Training/ExecuteTrainingScripts]**********")
     
     v1 = init_k8s_client()
     batch_v1 = client.BatchV1Api()  # 初始化 Batch API 用於創建 Job
@@ -570,26 +466,50 @@ async def execute_training_scripts(request: DagRequest):
     
     # 建立 Job
     try:
+        logger.info("Job creating...........")
         batch_v1.create_namespaced_job(namespace="ml-serving", body=job_manifest)
 
+        logger.info("Job execute start...........")
         # **等待 Job 完成**
-        wait_for_job_completion(batch_v1, job_name, "ml-serving")
+        wait_for_job_completion(batch_v1, job_name, "ml-serving",logger)
+
+        logger.info("Job finish!!!!!")
 
         record_mlflow(request, output_dir)
-        return {"status": "success", "message": "Task Job created", "job_name": job_name}
+        logger.info("Record to MLflow Successfully!!!!")
+        logger.info(f"Task Job created and finished . job_name {job_name}")
+        return {"status": "success", "message": "Task Job created and finished", "job_name": job_name}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create Task Job: {str(e)}")
 
-def wait_for_job_completion(batch_v1, job_name, namespace, timeout=3600):
+def wait_for_job_completion(batch_v1, job_name, namespace, logger, timeout=3600):
     """
     監聽 K8s Job 狀態，等待 Job 執行完成
     """
     start_time = time.time()
+    v1 = client.CoreV1Api()  # 初始化 K8s API
+    pod_name = None  # 儲存 task pod 名稱
     while time.time() - start_time < timeout:
         job_status = batch_v1.read_namespaced_job_status(job_name, namespace)
         if job_status.status.succeeded == 1:
-            print(f"Job {job_name} completed successfully.")
+            logger.info(f"Job {job_name} completed successfully.")
+            
+            # **讀取 Pod 名稱**
+            pod_list = v1.list_namespaced_pod(namespace, label_selector=f"job-name={job_name}").items
+            
+            if pod_list:
+                pod_name = pod_list[0].metadata.name
+                logger.info(f"Job pod name: {pod_name}")
+
+                # **獲取並記錄 Pod 的 logs**
+                try:
+                    logs = v1.read_namespaced_pod_log(name=pod_name, namespace=namespace)
+                    logger.info(f"Task Pod Logs for {job_name}:\n{logs}")
+                except Exception as e:
+                    logger.error(f"Failed to get logs for {pod_name}: {str(e)}")
+
             return
+        
         elif job_status.status.failed is not None and job_status.status.failed > 0:
             raise Exception(f"Job {job_name} failed.")
         time.sleep(10)  # 每 10 秒檢查一次 Job 狀態
@@ -604,6 +524,7 @@ def record_mlflow(request: DagRequest, output_dir: str):
     mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI"))
     mlflow.set_experiment(request.DAG_ID)
     dag_instance_unique_id = f'{request.DAG_ID}_{request.EXECUTION_ID}'
+
     with mlflow.start_run(run_name=dag_instance_unique_id):
         # 記錄 Request Body 為 Tags
         mlflow.set_tags(request.model_dump())
@@ -636,6 +557,59 @@ def record_mlflow(request: DagRequest, output_dir: str):
         mlflow.log_artifact(os.path.join(output_dir, "val_acc.png"))
         mlflow.log_artifact(excel_path)
 
+
+@app.post("/Trainng/UploadLogToS3")
+async def upload_log_to_s3(request: DagRequest):
+    
+    dag_id = request.DAG_ID
+    execution_id = request.EXECUTION_ID
+    task_stage_type = request.TASK_STAGE_TYPE
+
+    if not dag_id or not execution_id:
+        raise HTTPException(status_code=400, detail="DAG_ID and EXECUTION_ID are required.")
+    
+    # 組合路徑：/mnt/storage/{dag_id}_{execution_id}/LOGS
+    storage_path = STORAGE_PATH
+    logs_folder_path = Path(storage_path) / f"{dag_id}_{execution_id}" / "LOGS"
+
+    # 獲取 Logger 和 DVCWorker
+    logger = logger_manager.get_logger(dag_id, execution_id)
+    dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
+
+    try:
+        logger.info("**********[Training/UploadLogToS3]**********")
+
+        # Log 檔案路徑
+        log_file_path = logs_folder_path / f"{dag_id}_{execution_id}.txt"
+
+        if not log_file_path.exists():
+            raise HTTPException(status_code=404, detail=f"Log file {log_file_path} not found.")
+
+        # 重新命名檔案
+        renamed_log_filename = f"{dag_id}_{execution_id}_{task_stage_type}.txt"
+
+        # 上傳到 MinIO
+        target_path = f"{dag_id}_{execution_id}/logs/{renamed_log_filename}"
+
+        logger.info(f"Uploading log file: {log_file_path} to MinIO at {target_path}")
+
+        # 使用 DVCWorker 的 S3 客戶端上傳
+        dvc_worker.s3_client.upload_file(
+            Filename=str(log_file_path),
+            Bucket=dvc_worker.minio_bucket,
+            Key=target_path
+        )
+
+        logger.info("Log file uploaded successfully.")
+
+        return {
+            "status": "success",
+            "message": f"Log file uploaded to MinIO at {target_path}"
+        }
+
+    except Exception as e:
+        logger.error(f"An error occurred: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}") 
 
 #########################################################################
 
