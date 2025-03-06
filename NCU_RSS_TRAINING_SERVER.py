@@ -203,7 +203,8 @@ async def register_dag_and_logger_and_dvc_worker(request: DagRequest):
 
     # 獲取 Logger 和 DVCWorker
     logger = logger_manager.get_logger(dag_id, execution_id)
-    logger.info("**********[Training/RegisterDag]**********")
+    if logger:
+        logger_manager.log_section_header(logger, "Training/RegisterDag")
 
     # **打印請求的 request body**
     request_dict = request.model_dump()
@@ -228,9 +229,11 @@ async def setup_folders_for_training(request: DagRequest):
     
     # 獲取 Logger 和 DVCWorker
     logger = logger_manager.get_logger(dag_id, execution_id)
+    if logger:
+        logger_manager.log_section_header(logger, "Training/SetupFolder")
+    
     dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
     
-    logger.info("**********[Training/SetupFolder]**********")
     
     # 檢查 PVC 掛載狀態
     if not is_pvc_mounted():
@@ -309,6 +312,9 @@ async def download_dataset(request: DagRequest):
     
     # 獲取 Logger 和 DVCWorker
     logger = logger_manager.get_logger(dag_id, execution_id)
+    if logger:
+        logger_manager.log_section_header(logger, "Training/DownloadDataset")
+
     dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
     
     # 檢查 PVC 掛載狀態
@@ -322,7 +328,7 @@ async def download_dataset(request: DagRequest):
     
 
     try:
-        logger.info("**********[Training/DownloadDataset]**********")
+        
 
         # 初始化 MinIO 客戶端
         minio_client = dvc_worker.init_minio_client()
@@ -375,8 +381,10 @@ async def execute_training_scripts(request: DagRequest):
     
     # 獲取 Logger 和 DVCWorker
     logger = logger_manager.get_logger(dag_id, execution_id)
-    logger.info("**********[Training/ExecuteTrainingScripts]**********")
+    if logger:
+        logger_manager.log_section_header(logger, "Training/ExecuteTrainingScripts")
     
+
     v1 = init_k8s_client()
     batch_v1 = client.BatchV1Api()  # 初始化 Batch API 用於創建 Job
     
@@ -574,10 +582,12 @@ async def upload_log_to_s3(request: DagRequest):
 
     # 獲取 Logger 和 DVCWorker
     logger = logger_manager.get_logger(dag_id, execution_id)
+    if logger:
+        logger_manager.log_section_header(logger, "Training/UploadLogToS3")
     dvc_worker = dvc_manager.get_worker(dag_id, execution_id)
 
     try:
-        logger.info("**********[Training/UploadLogToS3]**********")
+        
 
         # Log 檔案路徑
         log_file_path = logs_folder_path / f"{dag_id}_{execution_id}.txt"
