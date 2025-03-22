@@ -7,10 +7,10 @@
             "request": "launch",
             "module": "uvicorn",
             "args": [
-                "MachineServer:app",
+                "NCU_RSS_Training_Server:app",
                 "--reload",
                 "--host", "10.52.52.136",
-                "--port", "8085"
+                "--port", "8001"
             ],
             "jinja": true,
             "console": "integratedTerminal",

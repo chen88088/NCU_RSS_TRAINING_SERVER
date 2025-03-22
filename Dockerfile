@@ -20,4 +20,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 EXPOSE 8001
 
 # 啟動 FastAPI 應用程式
-CMD ["uvicorn", "NCU_RSS_TRAINING_SERVER:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "NCU_RSS_Training_Server:app", "--host", "0.0.0.0", "--port", "8001"]

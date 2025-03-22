@@ -118,6 +118,7 @@ class DagRequest(BaseModel):
     MODEL_VERSION: str
     DEPLOYER_NAME: str
     DEPLOYER_EMAIL: str
+    PIPELINE_CONFIG: Dict[str, str]
 
 
 # 檢查 PVC 是否已掛載
@@ -148,9 +149,12 @@ def parse_dvc_file(dvc_file_path):
     
 # 初始化 Kubernetes 客戶端
 def init_k8s_client():
-    # 若在 K8s Cluster 內執行，則使用 In-Cluster Config
-    config.load_incluster_config()
-    return client.CoreV1Api()
+    try:
+        config.load_incluster_config()  # Kubernetes 內部環境
+    except config.ConfigException:
+        config.load_kube_config()  # 本機開發環境
+    return client.BatchV1Api()
+
 
 # 實例化 LoggerManager
 logger_manager = LoggerManager()
@@ -385,8 +389,8 @@ async def execute_training_scripts(request: DagRequest):
         logger_manager.log_section_header(logger, "Training/ExecuteTrainingScripts")
     
 
-    v1 = init_k8s_client()
-    batch_v1 = client.BatchV1Api()  # 初始化 Batch API 用於創建 Job
+    # v1 = init_k8s_client()
+    batch_v1 = init_k8s_client() # 初始化 Batch API 用於創建 Job
     
     # # Pod 名稱
     # pod_name = f"{dag_id}-{execution_id}-{task_stage_type}-task-pod-{uuid.uuid4().hex[:6]}"
@@ -565,7 +569,7 @@ def record_mlflow(request: DagRequest, output_dir: str):
         mlflow.log_artifact(os.path.join(output_dir, "val_acc.png"))
         mlflow.log_artifact(excel_path)
 
-
+# [Training/UploadLogToS3]
 @app.post("/Trainng/UploadLogToS3")
 async def upload_log_to_s3(request: DagRequest):
     
