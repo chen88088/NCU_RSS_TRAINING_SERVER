@@ -33,6 +33,7 @@ import uuid
 
 import time
 import json
+import hashlib
 
 # 设置基本的日志配置
 logging.basicConfig(level=logging.DEBUG)
@@ -400,6 +401,11 @@ async def execute_training_scripts(request: DagRequest):
     # 將 _ 換成 -，轉小寫，並移除不合法字元
     job_name = re.sub(r'[^a-z0-9\-]+', '', raw_job_name.lower().replace('_', '-'))
 
+    # 長度限制處理（K8s label/name 最多 63 字元）
+    if len(job_name) > 63:
+        hash_suffix = hashlib.sha1(job_name.encode()).hexdigest()[:6]
+        job_name = f"{job_name[:56]}-{hash_suffix}"
+
     
     # 確保 PVC_NAME 環境變量已設定
     pvc_name = os.getenv("PVC_NAME")
@@ -570,7 +576,7 @@ def record_mlflow(request: DagRequest, output_dir: str):
         mlflow.log_artifact(excel_path)
 
 # [Training/UploadLogToS3]
-@app.post("/Trainng/UploadLogToS3")
+@app.post("/Training/UploadLogToS3")
 async def upload_log_to_s3(request: DagRequest):
     
     dag_id = request.DAG_ID
